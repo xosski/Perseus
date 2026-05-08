@@ -1,0 +1,11 @@
+{
+  "sources": [
+    "https://feeds.bbci.co.uk/news/rss.xml",
+    "https://feeds.npr.org/1001/rss.xml",
+    "https://www.theguardian.com/world/rss",
+    "https://feeds.feedburner.com/TheHackersNews",
+    "https://krebsonsecurity.com/feed/",
+    "https://www.darkreading.com/rss.xml"
+  ],
+  "notes": "Feeds and normal websites are supported. Normal websites are ingested with a bounded same-site link scan. Add one trusted source URL per entry."
+}

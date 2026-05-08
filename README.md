@@ -4,9 +4,10 @@ This folder provides a standard, portable LLM layer built using the existing Had
 
 ## What It Uses
 
-- `llm_conversation_core.ConversationManager` for provider management and conversation persistence
+- `llm_conversation_core.ConversationManager` when available, with a built-in local conversation manager fallback
 - `ollama` as the default strict local-only generation backend
-- `offline_llm.OfflineLLM` as an optional fallback path only when explicitly enabled
+- A built-in local knowledge response path that keeps the app focused on learned sources when a generative model is not active
+- `offline_llm.OfflineLLM` as an optional enhanced fallback path only when installed and explicitly enabled
 
 ## Response Sophistication
 
@@ -14,14 +15,18 @@ This folder provides a standard, portable LLM layer built using the existing Had
 - Adaptive prompt contracts that favor candid, genuine feedback with clear reasoning and next steps
 - Response quality scoring that penalizes short, generic, flattering, unstructured, or low-reasoning answers
 - Single-pass response refinement when initial output quality is low
-- Strict local-only mode by default (no remote/fallback providers)
+- Strict local-only mode by default (Ollama first, learned-source knowledge response when needed)
 - Persistent self-improvement memory that learns from prior quality failures and injects corrective directives
 - Runtime session metrics (`success`, `fallbacks`, `average_quality`, `refinements_used`)
 
-## Web Learning Behavior
+## Knowledge Learning Behavior
 
-- News ingestion is feed-aware: it ingests both the feed source and linked article URLs
-- Each feed is bounded to a fixed number of story links per run to keep ingestion practical
+- Source-site ingestion accepts RSS/Atom feeds and normal websites in one persistent list
+- Feeds ingest both the feed source and linked article URLs
+- Normal websites ingest the page plus a bounded set of same-site links so Perseus can learn from trusted sources without manual browsing
+- Each source is bounded to keep ingestion practical
+- Local folder ingestion reads supported text files from a knowledge folder into the same learning store
+- Chat learning stores useful user inputs and completed exchanges as local memory so future answers can adapt to the user's facts, preferences, and project context
 - Prompt enrichment pulls multiple relevant context snippets from learned web knowledge
 - Grounded responses are expected to include an `Ingested Context Used` section when context is available
 - Ingestion errors are handled per-source so one bad URL does not disable the learner for the whole session
@@ -66,20 +71,40 @@ print(reply)
 reply, meta = llm.ask_with_metadata("Design a practical appsec roadmap for a startup team.")
 print(meta)
 
+# Ingest local knowledge files. By default this expects a `knowledge/` folder
+# beside this module, but you can pass any folder path.
+ingest_result = llm.ingest_folder("knowledge")
+print(ingest_result)
+
+# Persist and ingest trusted source sites/feeds.
+llm.save_source_sites([
+    "https://docs.python.org/3/",
+    "https://krebsonsecurity.com/feed/",
+])
+source_result = llm.ingest_source_sites()
+print(source_result)
+
 print(llm.get_stats())
 llm.close()
 ```
 
 ## Ingestion Notes
 
-- The desktop UI has a `Web Ingest` tab for bulk source ingestion and manual URL ingestion
-- Bulk ingest reports both feed success and linked article success counts
+- The desktop UI has a `Knowledge Ingest` tab for source-site ingestion, manual URL ingestion, and local folder ingestion
+- The source-site list is stored in `knowledge_sources.json`; edit it in the UI or directly as JSON
+- Source sites can be RSS/Atom feeds or normal websites; normal websites are scanned for a bounded number of same-site links
+- The included default local folder path is `knowledge`; drop files there or use the Browse button to choose another folder
+- Folder ingestion is recursive by default and supports `.txt`, `.md`, `.py`, `.json`, `.yaml`, `.yml`, `.csv`, `.html`, `.htm`, and `.log` files
+- Individual local files larger than 1 MB are skipped to keep ingestion responsive
+- User chat turns are learned into the same `llm_web_learning.db` store as `perseus://chat-memory/...` records
+- Source ingest reports both source success and linked page/article success counts
 - Learned content is stored in `llm_web_learning.db`
 
 ## Portability Notes
 
-- Defaults to strict local-only mode and requires a local provider (`ollama`)
-- In strict mode, remote/fallback providers are blocked and provider switching is limited to local providers
+- Defaults to strict local-only mode and prefers a local provider (`ollama`)
+- If a generative model is not active, the built-in local path keeps the app centered on ingested knowledge instead of web browsing
+- In strict mode, remote providers are blocked and provider switching is limited to local providers
 - If local provider output is weak, one refinement pass is attempted before returning best local result
 - Optional non-strict behavior is available via CLI flags when you intentionally want fallback behavior
 - Stores chat history in `llm_portable_conversations.db` by default

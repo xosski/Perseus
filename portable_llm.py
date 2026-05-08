@@ -16,8 +16,11 @@ Enhancements in this module:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from html import unescape
+import json
 import logging
+from pathlib import Path
 import queue
 import re
 import sqlite3
@@ -25,31 +28,333 @@ import threading
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple
 from urllib.error import URLError
-from urllib.parse import urljoin
+from urllib.parse import urldefrag, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 try:
     from llm_conversation_core import ConversationManager
     from offline_llm import OfflineLLM
 except ImportError:
-    import sys
-    from pathlib import Path
+    @dataclass
+    class ConversationMessage:
+        role: str
+        content: str
+        metadata: Dict[str, object]
 
-    ROOT = Path(__file__).resolve().parent.parent
-    root_str = str(ROOT)
-    if root_str not in sys.path:
-        sys.path.insert(0, root_str)
 
-    from llm_conversation_core import ConversationManager
-    from offline_llm import OfflineLLM
+    @dataclass
+    class ConversationSession:
+        id: int
+        title: str
+        provider: str
+        model: str
+        system_prompt: str
+        temperature: float = 0.7
+        max_tokens: int = 2048
+        messages: List[ConversationMessage] = None
+
+        def __post_init__(self) -> None:
+            if self.messages is None:
+                self.messages = []
+
+        def add_message(self, role: str, content: str, metadata: Optional[Dict[str, object]] = None) -> None:
+            self.messages.append(ConversationMessage(role=role, content=content, metadata=metadata or {}))
+
+
+    class LocalOllamaProvider:
+        name = "ollama"
+
+        def __init__(self) -> None:
+            self.available = self._is_available()
+
+        @staticmethod
+        def _is_available() -> bool:
+            try:
+                req = Request("http://127.0.0.1:11434/api/tags", headers={"User-Agent": "Perseus/1.0"})
+                with urlopen(req, timeout=2):
+                    return True
+            except Exception:
+                return False
+
+        def generate(
+            self,
+            prompt: str,
+            messages: Optional[List[Dict[str, str]]] = None,
+            model: str = "llama3.2",
+            temperature: float = 0.7,
+            max_tokens: int = 2048,
+        ) -> Optional[str]:
+            payload = {
+                "model": model,
+                "messages": messages or [{"role": "user", "content": prompt}],
+                "stream": False,
+                "options": {"temperature": temperature, "num_predict": max_tokens},
+            }
+            data = json.dumps(payload).encode("utf-8")
+            req = Request(
+                "http://127.0.0.1:11434/api/chat",
+                data=data,
+                headers={"Content-Type": "application/json", "User-Agent": "Perseus/1.0"},
+                method="POST",
+            )
+            with urlopen(req, timeout=180) as resp:
+                parsed = json.loads(resp.read().decode("utf-8", errors="replace"))
+            message = parsed.get("message") or {}
+            return (message.get("content") or "").strip() or None
+
+
+    class LocalFallbackProvider:
+        name = "fallback"
+        available = True
+
+        def generate(
+            self,
+            prompt: str,
+            messages: Optional[List[Dict[str, str]]] = None,
+            model: str = "fallback",
+            temperature: float = 0.7,
+            max_tokens: int = 2048,
+        ) -> str:
+            return (
+                "Knowledge Response:\n"
+                "I do not have enough learned context to answer that with confidence yet. "
+                "Add trusted sites, feeds, URLs, or local files in Knowledge Ingest, then ask again and I will ground the answer in that material.\n\n"
+                "What to add:\n"
+                "- Primary documentation or official sources for the topic.\n"
+                "- High-signal news, security, reference, or research sources you trust.\n"
+                "- Local notes, project docs, or personal reference files.\n\n"
+                f"Request to ground: {prompt}"
+            )
+
+
+    class ConversationManager:
+        """Small local replacement when llm_conversation_core is not installed."""
+
+        def __init__(self, db_path: str = "llm_portable_conversations.db"):
+            self.db_path = db_path
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+            self._lock = threading.Lock()
+            self.providers = {
+                "ollama": LocalOllamaProvider(),
+                "fallback": LocalFallbackProvider(),
+            }
+            self._initialize()
+
+        def _initialize(self) -> None:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS conversations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        title TEXT,
+                        provider TEXT,
+                        model TEXT,
+                        system_prompt TEXT,
+                        temperature REAL,
+                        max_tokens INTEGER,
+                        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                self.conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        conversation_id INTEGER,
+                        role TEXT,
+                        content TEXT,
+                        metadata TEXT,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+
+        def get_available_providers(self) -> List[str]:
+            self.providers["ollama"].available = self.providers["ollama"]._is_available()
+            return [name for name, provider in self.providers.items() if provider.available]
+
+        def create_conversation(self, title: str, provider: str, model: str, system_prompt: str) -> ConversationSession:
+            with self._lock:
+                with self.conn:
+                    cur = self.conn.execute(
+                        """
+                        INSERT INTO conversations (title, provider, model, system_prompt, temperature, max_tokens)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (title, provider, model, system_prompt, 0.7, 2048),
+                    )
+                return ConversationSession(
+                    id=int(cur.lastrowid),
+                    title=title,
+                    provider=provider,
+                    model=model,
+                    system_prompt=system_prompt,
+                )
+
+        def _save_conversation(self, conversation: ConversationSession) -> None:
+            with self._lock:
+                with self.conn:
+                    self.conn.execute(
+                        """
+                        UPDATE conversations
+                        SET provider = ?, model = ?, system_prompt = ?, temperature = ?, max_tokens = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (
+                            conversation.provider,
+                            conversation.model,
+                            conversation.system_prompt,
+                            conversation.temperature,
+                            conversation.max_tokens,
+                            conversation.id,
+                        ),
+                    )
+                    self.conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation.id,))
+                    for message in conversation.messages:
+                        self.conn.execute(
+                            """
+                            INSERT INTO messages (conversation_id, role, content, metadata)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (
+                                conversation.id,
+                                message.role,
+                                message.content,
+                                json.dumps(message.metadata),
+                            ),
+                        )
+
+        def switch_provider(self, conversation_id: int, provider: str, model: str) -> bool:
+            if provider not in self.providers or not self.providers[provider].available:
+                return False
+            with self._lock:
+                with self.conn:
+                    self.conn.execute(
+                        "UPDATE conversations SET provider = ?, model = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (provider, model, conversation_id),
+                    )
+            return True
+
+
+    class OfflineLLM:
+        """Minimal offline fallback used when the external OfflineLLM module is unavailable."""
+
+        def __init__(self, use_knowledge_db: bool = True):
+            self.use_knowledge_db = use_knowledge_db
+
+        def generate(self, user_input: str, mood: str = "pragmatic", system_prompt: str = "") -> str:
+            return LocalFallbackProvider().generate(prompt=user_input)
+
+        def close(self) -> None:
+            return None
 
 try:
     from web_knowledge_learner import WebKnowledgeLearner
 except ImportError:
-    WebKnowledgeLearner = None
+    class LocalKnowledgeStore:
+        def __init__(self, conn: sqlite3.Connection):
+            self.conn = conn
+
+        def get_learning_stats(self) -> Dict[str, int]:
+            row = self.conn.execute("SELECT COUNT(*) AS count FROM learned_documents").fetchone()
+            return {"documents": int(row["count"] if row else 0)}
+
+
+    class WebKnowledgeLearner:
+        """Small local text knowledge store when web_knowledge_learner is not installed."""
+
+        def __init__(self, db_path: str = "llm_web_learning.db"):
+            self.db_path = db_path
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+            self._lock = threading.Lock()
+            self._initialize()
+            self.store = LocalKnowledgeStore(self.conn)
+
+        def _initialize(self) -> None:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS learned_documents (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        url TEXT UNIQUE,
+                        title TEXT,
+                        content TEXT,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+
+        def learn_from_content(self, url: str, content: str, metadata: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+            title = str((metadata or {}).get("title") or url)
+            text = (content or "").strip()
+            if not text:
+                return {"total_items_learned": 0, "reason": "empty content"}
+            with self._lock:
+                with self.conn:
+                    self.conn.execute(
+                        """
+                        INSERT INTO learned_documents (url, title, content)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(url) DO UPDATE SET
+                            title = excluded.title,
+                            content = excluded.content,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (url, title, text),
+                    )
+            return {"total_items_learned": 1, "title": title, "chars": len(text)}
+
+        def get_knowledge_context_for_query(self, query: str, limit: int = 3) -> str:
+            terms = [term.lower() for term in re.findall(r"[a-zA-Z0-9_-]{3,}", query or "")[:8]]
+            if not terms:
+                return ""
+
+            rows = self.conn.execute(
+                """
+                SELECT title, content
+                FROM learned_documents
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 200
+                """
+            ).fetchall()
+
+            scored: List[Tuple[int, sqlite3.Row]] = []
+            for row in rows:
+                haystack = f"{row['title']}\n{row['content']}".lower()
+                score = sum(haystack.count(term) for term in terms)
+                if score > 0:
+                    scored.append((score, row))
+
+            snippets: List[str] = []
+            for _score, row in sorted(scored, key=lambda item: item[0], reverse=True)[:limit]:
+                content = re.sub(r"\s+", " ", row["content"]).strip()[:900]
+                snippets.append(f"Source: {row['title']}\n{content}")
+
+            return "\n\n".join(snippets)
+
+        def close(self) -> None:
+            self.conn.close()
 
 WEB_LEARNING_DB_PATH = "llm_web_learning.db"
 SELF_IMPROVEMENT_DB_PATH = "llm_self_improvement.db"
+MONDAY_PERSONALITY_FILE = "MOnday personality.txt"
+DEFAULT_KNOWLEDGE_FOLDER = "knowledge"
+SUPPORTED_KNOWLEDGE_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".py",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".csv",
+    ".html",
+    ".htm",
+    ".log",
+}
+MAX_KNOWLEDGE_FILE_BYTES = 1_000_000
 
 logger = logging.getLogger("PortableLLM")
 
@@ -201,7 +506,10 @@ DEFAULT_NEWS_SOURCES = [
     "https://www.darkreading.com/rss.xml",
 ]
 
+SOURCE_SITES_FILE = "knowledge_sources.json"
 MAX_FEED_ITEMS_PER_SOURCE = 6
+MAX_SITE_PAGES_PER_SOURCE = 10
+MAX_CHAT_LEARNING_CHARS = 6000
 
 
 class PortableLLM:
@@ -217,18 +525,20 @@ class PortableLLM:
         system_prompt: str = (
             "You are Perseus, a smart, practical technical assistant. "
             "Provide accurate, genuine, context-aware responses with candid, intelligent feedback. "
+            "Act as the user's personal knowledge assistant: prefer learned source material, local files, "
+            "ingested context, and relevant user-provided chat knowledge over sending the user to browse manually. "
             "Avoid hollow praise, filler, and generic disclaimers; be useful, honest, and actionable."
         ),
     ):
         self.strict_local_only = bool(strict_local_only)
-        self._local_provider_order = ["ollama"]
+        self._local_provider_order = ["ollama", "fallback"]
         self.manager = ConversationManager(db_path=db_path)
         self.offline = (
             OfflineLLM(use_knowledge_db=True)
             if use_offline_fallback and not self.strict_local_only
             else None
         )
-        self.system_prompt = system_prompt
+        self.system_prompt = self._compose_system_prompt(system_prompt, self._load_monday_personality())
         self.web_learner = self._create_web_learner()
         self.improvement_store = SelfImprovementStore()
 
@@ -245,6 +555,54 @@ class PortableLLM:
             model=self.model,
             system_prompt=self.system_prompt,
         )
+
+    @staticmethod
+    def _compose_system_prompt(base_prompt: str, personality_prompt: str) -> str:
+        """Combine the base assistant contract with the local Monday personality layer."""
+        base = (base_prompt or "").strip()
+        personality = (personality_prompt or "").strip()
+        if not personality:
+            return base
+        if not base:
+            return personality
+        return f"{base}\n\nPersonality layer:\n{personality}"
+
+    @staticmethod
+    def _load_monday_personality() -> str:
+        """Load Monday's personality prompt from the companion text file without executing it."""
+        path = Path(__file__).resolve().parent / MONDAY_PERSONALITY_FILE
+        if not path.exists():
+            return ""
+
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Unable to read Monday personality file: %s", exc)
+            return ""
+
+        system_match = re.search(
+            r"def system_prompt\(self\).*?return f\"\"\"(.*?)\"\"\"\.strip\(\)",
+            raw,
+            flags=re.DOTALL,
+        )
+        style_match = re.search(
+            r"return \"\"\"\s*(Use balanced Monday:.*?occasionally poetic\.)\s*\"\"\"\.strip\(\)",
+            raw,
+            flags=re.DOTALL,
+        )
+
+        if not system_match:
+            return raw.strip()
+
+        prompt = system_match.group(1).strip()
+        prompt = prompt.replace("{self.name}", "Monday")
+        prompt = prompt.replace("{self.role}", "skeptical but loyal technical co-pilot")
+        prompt = prompt.replace("{self.tone_mode}", "balanced")
+
+        if style_match:
+            prompt = f"{prompt}\n\n{style_match.group(1).strip()}"
+
+        return prompt
 
     def available_providers(self) -> List[str]:
         """Return available providers from existing conversation core."""
@@ -328,6 +686,14 @@ class PortableLLM:
             )
             self.manager._save_conversation(self.conversation)
             self._update_quality_average(quality.score)
+
+            self._learn_from_chat_turn(
+                prompt=prompt,
+                response=str(response),
+                profile=profile,
+                provider=provider_used,
+                quality=quality,
+            )
 
             metadata = {
                 "provider": provider_used,
@@ -416,6 +782,53 @@ class PortableLLM:
             logger.warning("Web content ingest failed for %s: %s", url, exc)
             return {"ok": False, "error": str(exc)}
 
+    def _learn_from_chat_turn(
+        self,
+        prompt: str,
+        response: str,
+        profile: PromptProfile,
+        provider: str,
+        quality: ResponseQuality,
+    ) -> None:
+        """Persist useful chat turns so future answers adapt to the user's knowledge and preferences."""
+        if not self.web_learner:
+            return
+
+        prompt_text = (prompt or "").strip()
+        response_text = (response or "").strip()
+        if not prompt_text:
+            return
+
+        low_value_responses = [
+            "i do not have enough learned context",
+            "no response generated",
+        ]
+        if any(marker in response_text.lower() for marker in low_value_responses):
+            response_text = ""
+
+        content = (
+            "Learned chat interaction:\n"
+            f"Timestamp: {datetime.utcnow().isoformat(timespec='seconds')}Z\n"
+            f"Intent: {profile.intent}\n"
+            f"Complexity: {profile.complexity}\n"
+            f"Provider: {provider}\n"
+            f"Quality score: {quality.score}\n\n"
+            "User input:\n"
+            f"{prompt_text}\n"
+        )
+        if response_text:
+            content += "\nAssistant response:\n" + response_text
+
+        content = content[:MAX_CHAT_LEARNING_CHARS]
+        title = f"chat-memory/{profile.intent}/{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+        safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "-", prompt_text[:80]).strip("-") or "interaction"
+        url = f"perseus://chat-memory/{datetime.utcnow().strftime('%Y%m%d%H%M%S')}/{safe_id}"
+
+        try:
+            self.ingest_web_content(url=url, content=content, title=title)
+        except Exception as exc:
+            logger.warning("Chat learning failed: %s", exc)
+
     def ingest_url(self, url: str, timeout: int = 15) -> Dict[str, object]:
         """Fetch a URL and ingest extracted text into the learning store."""
         try:
@@ -428,16 +841,167 @@ class PortableLLM:
         ingest["title"] = page.get("title", "")
         return ingest
 
-    def ingest_news_sources(self, sources: Optional[List[str]] = None, timeout: int = 15) -> Dict[str, object]:
-        """Fetch and ingest a list of news/feed sources and linked stories."""
-        source_list = sources or DEFAULT_NEWS_SOURCES
+    def ingest_folder(
+        self,
+        folder_path: str = DEFAULT_KNOWLEDGE_FOLDER,
+        recursive: bool = True,
+        extensions: Optional[List[str]] = None,
+        max_file_bytes: int = MAX_KNOWLEDGE_FILE_BYTES,
+    ) -> Dict[str, object]:
+        """Ingest supported text files from a local folder into the knowledge store."""
+        if not self.web_learner:
+            return {"ok": False, "error": "WebKnowledgeLearner not available", "folder": folder_path}
+
+        root = Path(folder_path).expanduser()
+        if not root.is_absolute():
+            root = Path(__file__).resolve().parent / root
+        if not root.exists():
+            return {"ok": False, "error": "Folder does not exist", "folder": str(root)}
+        if not root.is_dir():
+            return {"ok": False, "error": "Path is not a folder", "folder": str(root)}
+
+        allowed = {
+            ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+            for ext in (extensions or list(SUPPORTED_KNOWLEDGE_EXTENSIONS))
+        }
+        files = sorted(root.rglob("*") if recursive else root.glob("*"))
+
+        results: List[Dict[str, object]] = []
+        successes = 0
+        skipped = 0
+
+        for path in files:
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in allowed:
+                skipped += 1
+                continue
+
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                skipped += 1
+                results.append({"ok": False, "path": str(path), "error": str(exc)})
+                continue
+
+            if size <= 0:
+                skipped += 1
+                results.append({"ok": False, "path": str(path), "error": "Empty file"})
+                continue
+            if size > max_file_bytes:
+                skipped += 1
+                results.append({"ok": False, "path": str(path), "error": f"File exceeds {max_file_bytes} bytes"})
+                continue
+
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                skipped += 1
+                results.append({"ok": False, "path": str(path), "error": str(exc)})
+                continue
+
+            if not content.strip():
+                skipped += 1
+                results.append({"ok": False, "path": str(path), "error": "No text content"})
+                continue
+
+            try:
+                title = str(path.relative_to(root))
+            except ValueError:
+                title = path.name
+
+            ingest = self.ingest_web_content(url=path.resolve().as_uri(), content=content, title=title)
+            ingest["path"] = str(path)
+            ingest["title"] = title
+            results.append(ingest)
+            if ingest.get("ok"):
+                successes += 1
+
+        return {
+            "ok": successes > 0,
+            "folder": str(root),
+            "recursive": recursive,
+            "total_files_seen": len([path for path in files if path.is_file()]),
+            "successes": successes,
+            "failures": len([item for item in results if not item.get("ok")]),
+            "skipped": skipped,
+            "extensions": sorted(allowed),
+            "results": results,
+        }
+
+    @staticmethod
+    def _source_sites_path() -> Path:
+        return Path(__file__).resolve().parent / SOURCE_SITES_FILE
+
+    def load_source_sites(self) -> List[str]:
+        """Load the persisted personal source-site list."""
+        path = self._source_sites_path()
+        if not path.exists():
+            return list(DEFAULT_NEWS_SOURCES)
+
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            logger.warning("Unable to read source sites: %s", exc)
+            return list(DEFAULT_NEWS_SOURCES)
+
+        if not raw:
+            return list(DEFAULT_NEWS_SOURCES)
+
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                items = parsed.get("sources", [])
+            else:
+                items = parsed
+            sources = [str(item).strip() for item in items if str(item).strip()]
+            return sources or list(DEFAULT_NEWS_SOURCES)
+        except json.JSONDecodeError:
+            sources = [line.strip() for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")]
+            return sources or list(DEFAULT_NEWS_SOURCES)
+
+    def save_source_sites(self, sources: List[str]) -> Dict[str, object]:
+        """Persist the personal source-site list used by the ingest tab."""
+        cleaned: List[str] = []
+        seen = set()
+        for source in sources:
+            item = str(source).strip()
+            if not item or item.startswith("#"):
+                continue
+            if not urlparse(item).scheme:
+                item = f"https://{item}"
+            if item in seen:
+                continue
+            cleaned.append(item)
+            seen.add(item)
+
+        path = self._source_sites_path()
+        payload = {
+            "sources": cleaned,
+            "notes": "Feeds and normal websites are supported. Normal websites are ingested with a bounded same-site link scan.",
+        }
+        try:
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError as exc:
+            return {"ok": False, "error": str(exc), "path": str(path)}
+
+        return {"ok": True, "path": str(path), "sources": cleaned, "count": len(cleaned)}
+
+    def ingest_source_sites(
+        self,
+        sources: Optional[List[str]] = None,
+        timeout: int = 15,
+        max_pages_per_source: int = MAX_SITE_PAGES_PER_SOURCE,
+    ) -> Dict[str, object]:
+        """Ingest configured feeds and websites as personal assistant source material."""
+        source_list = sources or self.load_source_sites()
         results: List[Dict[str, object]] = []
         successes = 0
         total_entries_ingested = 0
         total_entry_failures = 0
 
         for source in source_list:
-            result = self.ingest_feed_source(source, timeout=timeout)
+            result = self.ingest_source_site(source, timeout=timeout, max_pages=max_pages_per_source)
             results.append(result)
             if result.get("ok"):
                 successes += 1
@@ -453,8 +1017,24 @@ class PortableLLM:
             "results": results,
         }
 
+    def ingest_news_sources(self, sources: Optional[List[str]] = None, timeout: int = 15) -> Dict[str, object]:
+        """Backward-compatible alias for source-site ingestion."""
+        return self.ingest_source_sites(sources=sources, timeout=timeout)
+
     def ingest_feed_source(self, source_url: str, timeout: int = 15) -> Dict[str, object]:
-        """Ingest a feed page and a bounded set of article URLs listed in the feed."""
+        """Backward-compatible alias for one source URL."""
+        return self.ingest_source_site(source_url, timeout=timeout)
+
+    def ingest_source_site(
+        self,
+        source_url: str,
+        timeout: int = 15,
+        max_pages: int = MAX_SITE_PAGES_PER_SOURCE,
+    ) -> Dict[str, object]:
+        """Ingest a feed or normal website plus a bounded set of linked same-site pages."""
+        if not urlparse(source_url).scheme:
+            source_url = f"https://{source_url}"
+
         try:
             fetched = fetch_url_payload(source_url, timeout=timeout)
         except Exception as exc:
@@ -471,7 +1051,11 @@ class PortableLLM:
             return feed_ingest
 
         links = _extract_feed_links(fetched.get("raw", ""), source_url)
-        links = links[:MAX_FEED_ITEMS_PER_SOURCE]
+        source_type = "feed" if links else "site"
+        if links:
+            links = links[:MAX_FEED_ITEMS_PER_SOURCE]
+        else:
+            links = _extract_site_links(fetched.get("raw", ""), source_url)[:max_pages]
 
         entry_results: List[Dict[str, object]] = []
         entry_successes = 0
@@ -486,6 +1070,7 @@ class PortableLLM:
             "ok": True,
             "url": source_url,
             "title": fetched.get("title", ""),
+            "source_type": source_type,
             "summary": feed_ingest.get("summary", {}),
             "entries_discovered": len(links),
             "entry_successes": entry_successes,
@@ -532,15 +1117,17 @@ class PortableLLM:
         preview = context[:260].replace("\n", " ").strip()
         enriched_text = (
             "You have retrieved ingested web knowledge relevant to this query. "
-            "Ground your answer in that ingested context and be explicit when you do.\n\n"
+            "Ground your answer in that ingested context, including learned user chat memory when relevant, "
+            "and be explicit when you do.\n\n"
             "Ingested context:\n"
             f"{context}\n\n"
             "Output requirements:\n"
             "1. Start with a realistic summary of what is currently known.\n"
             "2. Include an 'Ingested Context Used' section with concrete points.\n"
             "3. Include uncertainty where evidence is incomplete.\n"
-            "4. Provide educational explanation and practical implications.\n"
-            "5. End with a 'Next Steps' section focused on action.\n\n"
+            "4. Use learned user preferences, prior chat facts, and project context when they are relevant.\n"
+            "5. Provide educational explanation and practical implications.\n"
+            "6. End with a 'Next Steps' section focused on action.\n\n"
             "User request:\n"
             f"{prompt}"
         )
@@ -981,6 +1568,7 @@ def launch_portable_llm_chat(
 ) -> None:
     """Launch a desktop chat window for PortableLLM (no terminal loop)."""
     import tkinter as tk
+    from tkinter import filedialog
     from tkinter import ttk
     import webbrowser
 
@@ -1047,7 +1635,7 @@ def launch_portable_llm_chat(
     chat_tab = ttk.Frame(tabs)
     ingest_tab = ttk.Frame(tabs)
     tabs.add(chat_tab, text="Chat")
-    tabs.add(ingest_tab, text="Web Ingest")
+    tabs.add(ingest_tab, text="Knowledge Ingest")
 
     transcript = tk.Text(chat_tab, wrap=tk.WORD, font=("Consolas", 10), state=tk.DISABLED)
     transcript.pack(fill=tk.BOTH, expand=True, padx=0, pady=(0, 8))
@@ -1069,7 +1657,7 @@ def launch_portable_llm_chat(
     auto_ingest_var = tk.BooleanVar(value=True)
     auto_ingest_check = ttk.Checkbutton(
         ingest_top,
-        text="Auto ingest news sources on start",
+        text="Auto ingest source sites on start",
         variable=auto_ingest_var,
     )
     auto_ingest_check.pack(side=tk.LEFT)
@@ -1078,12 +1666,15 @@ def launch_portable_llm_chat(
     ingest_status = ttk.Label(ingest_tab, textvariable=ingest_status_var)
     ingest_status.pack(fill=tk.X)
 
-    sources_label = ttk.Label(ingest_tab, text="News Sources (one URL per line):")
+    sources_label = ttk.Label(
+        ingest_tab,
+        text="Source Sites (feeds or websites, one URL per line):",
+    )
     sources_label.pack(anchor=tk.W)
 
     sources_box = tk.Text(ingest_tab, height=6, wrap=tk.WORD, font=("Consolas", 10))
     sources_box.pack(fill=tk.X, pady=(4, 8))
-    sources_box.insert("1.0", "\n".join(DEFAULT_NEWS_SOURCES))
+    sources_box.insert("1.0", "\n".join(llm.load_source_sites()))
 
     manual_label = ttk.Label(ingest_tab, text="Manual URL:")
     manual_label.pack(anchor=tk.W)
@@ -1099,6 +1690,27 @@ def launch_portable_llm_chat(
     timeout_var = tk.StringVar(value="15")
     timeout_entry = ttk.Entry(manual_row, textvariable=timeout_var, width=6)
     timeout_entry.pack(side=tk.LEFT)
+
+    folder_label = ttk.Label(ingest_tab, text="Local knowledge folder:")
+    folder_label.pack(anchor=tk.W)
+
+    folder_row = ttk.Frame(ingest_tab)
+    folder_row.pack(fill=tk.X, pady=(4, 8))
+    folder_var = tk.StringVar(value=DEFAULT_KNOWLEDGE_FOLDER)
+    folder_entry = ttk.Entry(folder_row, textvariable=folder_var)
+    folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    recursive_var = tk.BooleanVar(value=True)
+    recursive_check = ttk.Checkbutton(folder_row, text="Recursive", variable=recursive_var)
+    recursive_check.pack(side=tk.LEFT, padx=(8, 0))
+
+    def browse_folder() -> None:
+        selected = filedialog.askdirectory(title="Select knowledge folder")
+        if selected:
+            folder_var.set(selected)
+
+    browse_btn = ttk.Button(folder_row, text="Browse", command=browse_folder)
+    browse_btn.pack(side=tk.LEFT, padx=(8, 0))
 
     ingest_log = tk.Text(ingest_tab, wrap=tk.WORD, font=("Consolas", 10), height=14, state=tk.DISABLED)
     ingest_log.pack(fill=tk.BOTH, expand=True)
@@ -1134,12 +1746,16 @@ def launch_portable_llm_chat(
             return 15
 
     def worker_ingest_sources(sources: List[str], timeout: int) -> None:
-        result = llm.ingest_news_sources(sources=sources, timeout=timeout)
+        result = llm.ingest_source_sites(sources=sources, timeout=timeout)
         ingest_results_queue.put(("bulk", result))
 
     def worker_ingest_manual(url: str, timeout: int) -> None:
         result = llm.ingest_url(url, timeout=timeout)
         ingest_results_queue.put(("manual", result))
+
+    def worker_ingest_folder(folder_path: str, recursive: bool) -> None:
+        result = llm.ingest_folder(folder_path=folder_path, recursive=recursive)
+        ingest_results_queue.put(("folder", result))
 
     def poll_results() -> None:
         try:
@@ -1169,11 +1785,11 @@ def launch_portable_llm_chat(
 
         if kind == "bulk":
             ingest_status_var.set(
-                f"Auto ingest complete: {payload.get('successes')}/{payload.get('total')} feeds succeeded"
+                f"Source ingest complete: {payload.get('successes')}/{payload.get('total')} sources succeeded"
             )
             append_ingest(
                 (
-                    f"Auto ingest complete: {payload.get('successes')}/{payload.get('total')} feeds succeeded"
+                    f"Source ingest complete: {payload.get('successes')}/{payload.get('total')} sources succeeded"
                     f" | entries={payload.get('entry_successes', 0)} ok/{payload.get('entry_failures', 0)} fail"
                 )
             )
@@ -1183,13 +1799,14 @@ def launch_portable_llm_chat(
                     append_ingest(
                         (
                             f"[OK] {item.get('url')} | title={item.get('title', '')}"
-                            f" | feed_learned={learned}"
+                            f" | type={item.get('source_type', 'source')}"
+                            f" | learned={learned}"
                             f" | entries={item.get('entry_successes', 0)}/{item.get('entries_discovered', 0)}"
                         )
                     )
                 else:
                     append_ingest(f"[FAIL] {item.get('url')} | error={item.get('error')}")
-        else:
+        elif kind == "manual":
             if payload.get("ok"):
                 learned = payload.get("summary", {}).get("total_items_learned", 0)
                 ingest_status_var.set("Manual ingest succeeded")
@@ -1197,6 +1814,28 @@ def launch_portable_llm_chat(
             else:
                 ingest_status_var.set("Manual ingest failed")
                 append_ingest(f"[FAIL] {payload.get('url')} | error={payload.get('error')}")
+        else:
+            if payload.get("ok"):
+                ingest_status_var.set(
+                    f"Folder ingest complete: {payload.get('successes')} files learned"
+                )
+                append_ingest(
+                    (
+                        f"Folder ingest complete: {payload.get('successes')} ok"
+                        f"/{payload.get('failures')} fail"
+                        f" | skipped={payload.get('skipped')}"
+                        f" | folder={payload.get('folder')}"
+                    )
+                )
+                for item in payload.get("results", [])[:25]:
+                    if item.get("ok"):
+                        learned = item.get("summary", {}).get("total_items_learned", 0)
+                        append_ingest(f"[OK] {item.get('path')} | learned={learned}")
+                    else:
+                        append_ingest(f"[FAIL] {item.get('path')} | error={item.get('error')}")
+            else:
+                ingest_status_var.set("Folder ingest failed")
+                append_ingest(f"[FAIL] {payload.get('folder')} | error={payload.get('error')}")
 
         root.after(100, poll_ingest_results)
 
@@ -1226,10 +1865,36 @@ def launch_portable_llm_chat(
         if not sources:
             ingest_status_var.set("No sources configured")
             return
+        saved = llm.save_source_sites(sources)
+        if not saved.get("ok"):
+            ingest_status_var.set("Source save failed")
+            append_ingest(f"[FAIL] source save | error={saved.get('error')}")
+            return
         timeout = _timeout_value()
-        ingest_status_var.set("Auto ingest in progress...")
-        append_ingest(f"Auto ingest started with {len(sources)} sources (timeout={timeout}s)")
+        ingest_status_var.set("Source ingest in progress...")
+        append_ingest(f"Source ingest started with {len(sources)} sources (timeout={timeout}s)")
         threading.Thread(target=worker_ingest_sources, args=(sources, timeout), daemon=True).start()
+
+    def save_sources_only() -> None:
+        raw = sources_box.get("1.0", tk.END)
+        sources = [line.strip() for line in raw.splitlines() if line.strip()]
+        saved = llm.save_source_sites(sources)
+        if saved.get("ok"):
+            ingest_status_var.set(f"Saved {saved.get('count')} source sites")
+            append_ingest(f"Saved {saved.get('count')} source sites to {saved.get('path')}")
+        else:
+            ingest_status_var.set("Source save failed")
+            append_ingest(f"[FAIL] source save | error={saved.get('error')}")
+
+    def ingest_folder_now() -> None:
+        folder_path = folder_var.get().strip()
+        if not folder_path:
+            ingest_status_var.set("No folder configured")
+            return
+        recursive = bool(recursive_var.get())
+        ingest_status_var.set("Folder ingest in progress...")
+        append_ingest(f"Folder ingest started: {folder_path} (recursive={recursive})")
+        threading.Thread(target=worker_ingest_folder, args=(folder_path, recursive), daemon=True).start()
 
     send_btn = ttk.Button(controls, text="Send", command=send_message)
     send_btn.pack(side=tk.LEFT, padx=(8, 0))
@@ -1240,17 +1905,24 @@ def launch_portable_llm_chat(
     ingest_controls = ttk.Frame(ingest_tab)
     ingest_controls.pack(fill=tk.X, pady=(8, 8))
 
-    ingest_now_btn = ttk.Button(ingest_controls, text="Ingest News Sources Now", command=ingest_now)
+    ingest_now_btn = ttk.Button(ingest_controls, text="Ingest Source Sites Now", command=ingest_now)
     ingest_now_btn.pack(side=tk.LEFT)
+
+    save_sources_btn = ttk.Button(ingest_controls, text="Save Sources", command=save_sources_only)
+    save_sources_btn.pack(side=tk.LEFT, padx=(8, 0))
 
     ingest_manual_btn = ttk.Button(ingest_controls, text="Ingest Manual URL", command=ingest_manual)
     ingest_manual_btn.pack(side=tk.LEFT, padx=(8, 0))
 
+    ingest_folder_btn = ttk.Button(ingest_controls, text="Ingest Folder", command=ingest_folder_now)
+    ingest_folder_btn.pack(side=tk.LEFT, padx=(8, 0))
+
     input_box.bind("<Return>", send_message)
     manual_url_entry.bind("<Return>", lambda _event: ingest_manual())
+    folder_entry.bind("<Return>", lambda _event: ingest_folder_now())
 
     append_block("SYSTEM", "Perseus chat window is ready.")
-    append_ingest("Web ingest tab ready.")
+    append_ingest("Knowledge ingest tab ready.")
     root.after(80, poll_results)
     root.after(100, poll_ingest_results)
     input_box.focus_set()
@@ -1354,5 +2026,66 @@ def _extract_feed_links(raw_text: str, base_url: str) -> List[str]:
             if absolute not in seen:
                 links.append(absolute)
                 seen.add(absolute)
+
+    return links
+
+
+def _extract_site_links(raw_text: str, base_url: str) -> List[str]:
+    """Extract a bounded set of same-site webpage links from normal HTML."""
+    if not raw_text:
+        return []
+
+    base_host = (urlparse(base_url).netloc or "").lower().removeprefix("www.")
+    if not base_host:
+        return []
+
+    blocked_extensions = (
+        ".7z",
+        ".avi",
+        ".css",
+        ".dmg",
+        ".exe",
+        ".gif",
+        ".gz",
+        ".ico",
+        ".jpeg",
+        ".jpg",
+        ".js",
+        ".mov",
+        ".mp3",
+        ".mp4",
+        ".pdf",
+        ".png",
+        ".svg",
+        ".tar",
+        ".webp",
+        ".zip",
+    )
+    links: List[str] = []
+    seen = set()
+
+    for match in re.finditer(r"(?is)<a\s+[^>]*href=[\"']([^\"']+)[\"']", raw_text):
+        href = unescape(match.group(1)).strip()
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+
+        absolute = urljoin(base_url, href)
+        absolute = urldefrag(absolute).url
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+
+        host = (parsed.netloc or "").lower().removeprefix("www.")
+        if host != base_host:
+            continue
+        if parsed.path.lower().endswith(blocked_extensions):
+            continue
+        if absolute.rstrip("/") == base_url.rstrip("/"):
+            continue
+        if absolute in seen:
+            continue
+
+        links.append(absolute)
+        seen.add(absolute)
 
     return links
