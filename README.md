@@ -5,7 +5,8 @@ This folder provides a standard, portable LLM layer built using the existing Had
 ## What It Uses
 
 - `llm_conversation_core.ConversationManager` for provider management and conversation persistence
-- `offline_llm.OfflineLLM` for smart local fallback responses
+- `ollama` as the default strict local-only generation backend
+- `offline_llm.OfflineLLM` as an optional fallback path only when explicitly enabled
 
 ## Response Sophistication
 
@@ -13,7 +14,8 @@ This folder provides a standard, portable LLM layer built using the existing Had
 - Adaptive prompt contracts that enforce `Summary`, `Reasoning`, and `Next Steps`
 - Response quality scoring that penalizes short, generic, unstructured, or low-reasoning answers
 - Single-pass response refinement when initial output quality is low
-- Provider failover chain before local offline fallback
+- Strict local-only mode by default (no remote/fallback providers)
+- Persistent self-improvement memory that learns from prior quality failures and injects corrective directives
 - Runtime session metrics (`success`, `fallbacks`, `average_quality`, `refinements_used`)
 
 ## Web Learning Behavior
@@ -36,6 +38,18 @@ Choose provider explicitly:
 
 ```bash
 python cli.py --provider ollama --model llama3.2
+```
+
+Enable non-strict mode (allows fallbacks/remotes):
+
+```bash
+python cli.py --allow-fallbacks
+```
+
+Enable OfflineLLM fallback (only works with `--allow-fallbacks`):
+
+```bash
+python cli.py --allow-fallbacks --use-offline-fallback
 ```
 
 ## Python Usage
@@ -64,7 +78,9 @@ llm.close()
 
 ## Portability Notes
 
-- Defaults to the best available provider in this order: `ollama`, `openai`, `mistral`, `azure`, `fallback`
-- If a provider response is weak, one refinement pass is attempted before failover
-- If no provider returns a usable answer, it uses `OfflineLLM` for educated/smart local responses
+- Defaults to strict local-only mode and requires a local provider (`ollama`)
+- In strict mode, remote/fallback providers are blocked and provider switching is limited to local providers
+- If local provider output is weak, one refinement pass is attempted before returning best local result
+- Optional non-strict behavior is available via CLI flags when you intentionally want fallback behavior
 - Stores chat history in `llm_portable_conversations.db` by default
+- Stores self-improvement episodes in `llm_self_improvement.db` to guide future prompting

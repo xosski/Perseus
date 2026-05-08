@@ -20,6 +20,7 @@ from html import unescape
 import logging
 import queue
 import re
+import sqlite3
 import threading
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple
@@ -48,6 +49,7 @@ except ImportError:
     WebKnowledgeLearner = None
 
 WEB_LEARNING_DB_PATH = "llm_web_learning.db"
+SELF_IMPROVEMENT_DB_PATH = "llm_self_improvement.db"
 
 logger = logging.getLogger("PortableLLM")
 
@@ -91,6 +93,99 @@ class EnrichedPrompt:
     context_preview: str = ""
 
 
+class SelfImprovementStore:
+    """Persist lightweight generation outcomes so prompting can improve over time."""
+
+    def __init__(self, db_path: str = SELF_IMPROVEMENT_DB_PATH):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._initialize()
+
+    def _initialize(self) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS improvement_episodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    intent TEXT,
+                    quality_score INTEGER,
+                    quality_reasons TEXT,
+                    was_refined INTEGER,
+                    used_context INTEGER,
+                    response_chars INTEGER
+                )
+                """
+            )
+
+    def record(
+        self,
+        intent: str,
+        quality_score: int,
+        quality_reasons: List[str],
+        was_refined: bool,
+        used_context: bool,
+        response_chars: int,
+    ) -> None:
+        reasons_blob = "\n".join(quality_reasons or [])
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO improvement_episodes
+                    (intent, quality_score, quality_reasons, was_refined, used_context, response_chars)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        intent,
+                        int(quality_score),
+                        reasons_blob,
+                        1 if was_refined else 0,
+                        1 if used_context else 0,
+                        int(response_chars),
+                    ),
+                )
+
+    def guidance_for_intent(self, intent: str, sample_size: int = 60) -> List[str]:
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT quality_score, quality_reasons, response_chars
+                FROM improvement_episodes
+                WHERE intent = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (intent, int(sample_size)),
+            ).fetchall()
+
+        if not rows:
+            return []
+
+        reason_blob = "\n".join((row["quality_reasons"] or "") for row in rows).lower()
+        avg_chars = sum(int(row["response_chars"] or 0) for row in rows) / max(1, len(rows))
+        guidance: List[str] = []
+
+        if reason_blob.count("missing structured presentation") >= 3:
+            guidance.append("Use clear section headers with concise bullets for dense prompts.")
+        if reason_blob.count("missing actionable next steps") >= 2:
+            guidance.append("Always close with concrete next steps that can be executed immediately.")
+        if reason_blob.count("limited explicit reasoning depth") >= 3:
+            guidance.append("Show explicit cause/effect reasoning, assumptions, and trade-offs.")
+        if reason_blob.count("too short for an educated response") >= 2 or avg_chars < 350:
+            guidance.append("Increase depth with practical details, not filler.")
+        if reason_blob.count("did not clearly ground answer in ingested context") >= 2:
+            guidance.append("When context exists, explicitly cite what was used from ingested knowledge.")
+
+        return guidance[:4]
+
+    def close(self) -> None:
+        with self._lock:
+            self.conn.close()
+
+
 DEFAULT_NEWS_SOURCES = [
     "http://rss.cnn.com/rss/cnn_topstories.rss",
     "http://feeds.foxnews.com/foxnews/latest",
@@ -114,22 +209,30 @@ class PortableLLM:
         db_path: str = "llm_portable_conversations.db",
         provider: Optional[str] = None,
         model: Optional[str] = None,
-        use_offline_fallback: bool = True,
+        use_offline_fallback: bool = False,
+        strict_local_only: bool = True,
         system_prompt: str = (
             "You are Perseus, a smart, practical technical assistant. "
             "Provide accurate, structured, and actionable responses."
         ),
     ):
+        self.strict_local_only = bool(strict_local_only)
+        self._local_provider_order = ["ollama"]
         self.manager = ConversationManager(db_path=db_path)
-        self.offline = OfflineLLM(use_knowledge_db=True) if use_offline_fallback else None
+        self.offline = (
+            OfflineLLM(use_knowledge_db=True)
+            if use_offline_fallback and not self.strict_local_only
+            else None
+        )
         self.system_prompt = system_prompt
         self.web_learner = self._create_web_learner()
+        self.improvement_store = SelfImprovementStore()
 
         self.stats = LLMStats()
         self._quality_threshold = 72
         self._max_history_messages = 20
 
-        self.provider = provider or self._pick_provider()
+        self.provider = self._resolve_provider(provider)
         self.model = model or self._default_model_for(self.provider)
 
         self.conversation = self.manager.create_conversation(
@@ -198,6 +301,14 @@ class PortableLLM:
 
         if response and str(response).strip():
             model_used = self.model if provider_used == self.provider else self._default_model_for(provider_used)
+            self.improvement_store.record(
+                intent=profile.intent,
+                quality_score=quality.score,
+                quality_reasons=quality.reasons,
+                was_refined=refined,
+                used_context=enriched.has_context,
+                response_chars=len(str(response)),
+            )
             self.conversation.add_message(
                 "assistant",
                 response,
@@ -225,6 +336,7 @@ class PortableLLM:
                 "complexity": profile.complexity,
                 "grounded_with_ingested_context": enriched.has_context,
                 "context_preview": enriched.context_preview,
+                "strict_local_only": self.strict_local_only,
             }
             return response, metadata
 
@@ -268,6 +380,8 @@ class PortableLLM:
 
     def set_provider(self, provider: str, model: Optional[str] = None) -> bool:
         """Switch provider for the active conversation."""
+        if self.strict_local_only and provider not in self._local_provider_order:
+            return False
         selected_model = model or self._default_model_for(provider)
         switched = self.manager.switch_provider(self.conversation.id, provider, selected_model)
         if switched:
@@ -279,6 +393,7 @@ class PortableLLM:
 
     def close(self) -> None:
         """Release local resources."""
+        self.improvement_store.close()
         if self.web_learner:
             self.web_learner.close()
         if self.offline:
@@ -491,7 +606,11 @@ class PortableLLM:
 
     def _provider_candidates(self) -> List[str]:
         """Rank providers for this request, preserving selected primary first."""
-        ordered = [self.provider, "ollama", "openai", "mistral", "azure", "fallback"]
+        ordered = [self.provider]
+        if self.strict_local_only:
+            ordered.extend(self._local_provider_order)
+        else:
+            ordered.extend(["ollama", "openai", "mistral", "azure", "fallback"])
         seen = set()
         candidates: List[str] = []
 
@@ -608,6 +727,11 @@ class PortableLLM:
             f"{response_contract}"
         )
 
+        learned_guidance = self.improvement_store.guidance_for_intent(profile.intent)
+        if learned_guidance:
+            guidance_block = "\n".join(f"- {item}" for item in learned_guidance)
+            system += f"\nSelf-improvement directives from prior sessions:\n{guidance_block}"
+
         if refine and prior_response:
             system += (
                 "\nImprove the previous draft by increasing specificity, correctness, and practical detail. "
@@ -720,11 +844,30 @@ class PortableLLM:
     def _pick_provider(self) -> str:
         """Pick the best available provider with portability in mind."""
         available = self.manager.get_available_providers()
+        if self.strict_local_only:
+            for candidate in self._local_provider_order:
+                if candidate in available:
+                    return candidate
+            raise RuntimeError(
+                "Strict local-only mode is enabled, but no local provider is available. "
+                "Install/start Ollama or disable strict mode."
+            )
+
         preferred_order = ["ollama", "openai", "mistral", "azure", "fallback"]
         for candidate in preferred_order:
             if candidate in available:
                 return candidate
         return "fallback"
+
+    def _resolve_provider(self, provider: Optional[str]) -> str:
+        if provider:
+            if self.strict_local_only and provider not in self._local_provider_order:
+                raise ValueError(
+                    f"Provider '{provider}' is not allowed in strict local-only mode. "
+                    f"Allowed providers: {', '.join(self._local_provider_order)}"
+                )
+            return provider
+        return self._pick_provider()
 
     @staticmethod
     def _default_model_for(provider: str) -> str:
@@ -743,13 +886,21 @@ def launch_portable_llm_chat(
     db_path: str = "llm_portable_conversations.db",
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    strict_local_only: bool = True,
+    use_offline_fallback: bool = False,
 ) -> None:
     """Launch a desktop chat window for PortableLLM (no terminal loop)."""
     import tkinter as tk
     from tkinter import ttk
     import webbrowser
 
-    llm = PortableLLM(db_path=db_path, provider=provider, model=model)
+    llm = PortableLLM(
+        db_path=db_path,
+        provider=provider,
+        model=model,
+        strict_local_only=strict_local_only,
+        use_offline_fallback=use_offline_fallback,
+    )
     result_queue: queue.Queue[Tuple[str, Dict[str, object]]] = queue.Queue()
 
     root = tk.Tk()
