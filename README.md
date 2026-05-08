@@ -10,9 +10,9 @@ This folder provides a standard, portable LLM layer built using the existing Had
 
 ## Response Sophistication
 
-- Intent profiling for each prompt (`technical`, `educational`, `strategic`, `analytical`)
-- Adaptive prompt contracts that enforce `Summary`, `Reasoning`, and `Next Steps`
-- Response quality scoring that penalizes short, generic, unstructured, or low-reasoning answers
+- Intent profiling for each prompt (`technical`, `educational`, `strategic`, `analytical`, `feedback`)
+- Adaptive prompt contracts that favor candid, genuine feedback with clear reasoning and next steps
+- Response quality scoring that penalizes short, generic, flattering, unstructured, or low-reasoning answers
 - Single-pass response refinement when initial output quality is low
 - Strict local-only mode by default (no remote/fallback providers)
 - Persistent self-improvement memory that learns from prior quality failures and injects corrective directives

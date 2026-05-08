@@ -216,7 +216,8 @@ class PortableLLM:
         strict_local_only: bool = True,
         system_prompt: str = (
             "You are Perseus, a smart, practical technical assistant. "
-            "Provide accurate, structured, and actionable responses."
+            "Provide accurate, genuine, context-aware responses with candid, intelligent feedback. "
+            "Avoid hollow praise, filler, and generic disclaimers; be useful, honest, and actionable."
         ),
     ):
         self.strict_local_only = bool(strict_local_only)
@@ -592,7 +593,9 @@ class PortableLLM:
         lower = prompt.lower()
         words = prompt.split()
 
-        if any(token in lower for token in ["compare", "tradeoff", "trade-off", "evaluate", "analyze", "analysis"]):
+        if any(token in lower for token in ["feedback", "critique", "review", "thoughts", "opinion", "advise", "advice"]):
+            intent = "feedback"
+        elif any(token in lower for token in ["compare", "tradeoff", "trade-off", "evaluate", "analyze", "analysis"]):
             intent = "analytical"
         elif any(token in lower for token in ["plan", "strategy", "roadmap", "prioritize", "recommend"]):
             intent = "strategic"
@@ -602,16 +605,18 @@ class PortableLLM:
             intent = "technical"
 
         complexity = "high" if len(words) > 20 or any(t in lower for t in ["architecture", "constraints", "production", "distributed"]) else "normal"
-        mood = "analytical" if intent in {"technical", "analytical"} else "pragmatic"
+        mood = "analytical" if intent in {"technical", "analytical", "feedback"} else "pragmatic"
         conversational_markers = ["chat", "talk", "casual", "normal", "plain english", "simple terms"]
         concise_markers = ["brief", "short", "concise", "tldr", "quick answer", "one-liner", "one line"]
         structured_markers = ["steps", "plan", "outline", "table", "bullet", "checklist", "roadmap", "compare"]
 
         prefer_concise = any(marker in lower for marker in concise_markers)
-        prefer_structure = any(marker in lower for marker in structured_markers) or intent in {"strategic", "analytical"}
+        prefer_structure = any(marker in lower for marker in structured_markers) or intent in {"strategic", "analytical", "feedback"}
         conversational = any(marker in lower for marker in conversational_markers) or not prefer_structure
 
-        if prefer_structure:
+        if intent == "feedback":
+            expected_shape = "feedback"
+        elif prefer_structure:
             expected_shape = "structured"
         elif prefer_concise:
             expected_shape = "concise"
@@ -740,10 +745,17 @@ class PortableLLM:
     ) -> List[Dict[str, str]]:
         """Create API-formatted messages with adaptive instructions and short memory."""
         response_contract = [
-            "Respond like a capable general-purpose assistant: natural, clear, and directly useful.",
+            "Respond like a capable general-purpose assistant: natural, thoughtful, clear, and directly useful.",
             "Match the user's tone and requested depth.",
-            "If uncertain, state assumptions and what data is needed.",
+            "Give genuine feedback: identify what is strong, what is weak, why it matters, and what to do next.",
+            "Do not flatter, over-agree, or pad the answer; be candid without being harsh.",
+            "If uncertain, state assumptions, confidence, and what data is needed instead of inventing details.",
         ]
+
+        if profile.intent == "feedback":
+            response_contract.append(
+                "For feedback requests, lead with the core judgment, then give specific evidence, trade-offs, and prioritized improvements."
+            )
 
         if profile.prefer_structure:
             response_contract.append(
@@ -774,8 +786,8 @@ class PortableLLM:
 
         if refine and prior_response:
             system += (
-                "\nImprove the previous draft by increasing specificity, correctness, and practical detail. "
-                "Remove generic phrasing and tighten structure."
+                "\nImprove the previous draft by increasing specificity, correctness, practical detail, and genuine judgment. "
+                "Remove generic phrasing, hollow encouragement, and unsupported claims; tighten structure."
             )
 
         history = self.conversation.messages[-self._max_history_messages :]
@@ -817,6 +829,12 @@ class PortableLLM:
             "i'm unable to",
             "i do not have access",
         ]
+        filler_markers = [
+            "great question",
+            "that's a great question",
+            "you're absolutely right",
+            "it depends" if len(text) < 220 else "",
+        ]
 
         min_len = 60 if profile.prefer_concise else 90
         brief_len = 110 if profile.prefer_concise else 150
@@ -831,6 +849,10 @@ class PortableLLM:
         if any(marker in lower for marker in generic_markers):
             score -= 35
             reasons.append("Contains generic low-value fallback phrasing")
+
+        if any(marker and marker in lower for marker in filler_markers):
+            score -= 10
+            reasons.append("Contains filler or hollow agreement instead of direct value")
 
         if profile.prefer_structure or profile.intent in {"strategic", "analytical"}:
             has_structure = any(token in text for token in ["\n-", "\n1.", ":\n", "##"])
@@ -851,6 +873,26 @@ class PortableLLM:
             if not any(marker in lower for marker in technical_signals):
                 score -= 4
                 reasons.append("Could use slightly more practical reasoning")
+
+        if profile.intent == "feedback":
+            feedback_signals = [
+                "because",
+                "risk",
+                "trade-off",
+                "recommend",
+                "improve",
+                "strong",
+                "weak",
+                "next",
+            ]
+            if sum(1 for marker in feedback_signals if marker in lower) < 3:
+                score -= 14
+                reasons.append("Feedback is not specific or actionable enough")
+
+            judgment_signals = ["i would", "my read", "the issue", "the strongest", "the weakest", "priority"]
+            if not any(marker in lower for marker in judgment_signals):
+                score -= 8
+                reasons.append("Missing a clear, candid judgment")
 
         if "?" in text and len(text) < 140:
             score -= 8
