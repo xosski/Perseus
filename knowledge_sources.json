@@ -7,5 +7,5 @@
     "https://krebsonsecurity.com/feed/",
     "https://www.darkreading.com/rss.xml"
   ],
-  "notes": "Feeds and normal websites are supported. Normal websites are ingested with a bounded same-site link scan. Add one trusted source URL per entry."
+  "notes": "Feeds and normal websites are supported. Normal websites are ingested with a bounded same-site link scan."
 }

@@ -15,6 +15,7 @@ Enhancements in this module:
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 from datetime import datetime
 from html import unescape
@@ -26,6 +27,7 @@ import re
 import sqlite3
 import threading
 import xml.etree.ElementTree as ET
+import zipfile
 from typing import Dict, List, Optional, Tuple
 from urllib.error import URLError
 from urllib.parse import urldefrag, urljoin, urlparse
@@ -71,8 +73,9 @@ except ImportError:
         def _is_available() -> bool:
             try:
                 req = Request("http://127.0.0.1:11434/api/tags", headers={"User-Agent": "Perseus/1.0"})
-                with urlopen(req, timeout=2):
-                    return True
+                with urlopen(req, timeout=2) as resp:
+                    payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+                return bool(payload.get("models"))
             except Exception:
                 return False
 
@@ -88,7 +91,7 @@ except ImportError:
                 "model": model,
                 "messages": messages or [{"role": "user", "content": prompt}],
                 "stream": False,
-                "options": {"temperature": temperature, "num_predict": max_tokens},
+                "options": {"temperature": temperature, "num_predict": max_tokens, "num_ctx": 8192},
             }
             data = json.dumps(payload).encode("utf-8")
             req = Request(
@@ -115,6 +118,32 @@ except ImportError:
             temperature: float = 0.7,
             max_tokens: int = 2048,
         ) -> str:
+            user_prompt = _extract_user_request(prompt)
+            prompt_lower = user_prompt.lower()
+
+            if _is_capability_prompt(user_prompt):
+                return _capability_response()
+
+            general_answer = _general_knowledge_fallback(user_prompt)
+            if general_answer:
+                return general_answer
+
+            if _is_general_knowledge_prompt(user_prompt):
+                return _heuristic_general_answer(user_prompt)
+
+            if _is_small_talk_prompt(user_prompt):
+                if any(token in prompt_lower for token in ["how are you", "how's it going", "how is it going"]):
+                    return (
+                        "I'm doing alright - alert, local, and mildly annoyed that Ollama is not available, "
+                        "but still ready to help. Tell me what we're working on today."
+                    )
+                if any(token in prompt_lower for token in ["hello", "hi", "hey", "good morning", "good afternoon", "good evening"]):
+                    return "Hey - I'm here. Ask me anything, or point me at a file/folder and I'll work from it."
+                if "thank" in prompt_lower:
+                    return "You're welcome. Send the next thing when you're ready."
+
+                return "I'm here and ready. What would you like to dig into?"
+
             return (
                 "Knowledge Response:\n"
                 "I do not have enough learned context to answer that with confidence yet. "
@@ -123,7 +152,7 @@ except ImportError:
                 "- Primary documentation or official sources for the topic.\n"
                 "- High-signal news, security, reference, or research sources you trust.\n"
                 "- Local notes, project docs, or personal reference files.\n\n"
-                f"Request to ground: {prompt}"
+                f"Request to ground: {user_prompt}"
             )
 
 
@@ -335,16 +364,38 @@ except ImportError:
 
             return "\n\n".join(snippets)
 
+        def get_all_knowledge_context(self, limit: int = 8) -> str:
+            rows = self.conn.execute(
+                """
+                SELECT title, content
+                FROM learned_documents
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+
+            snippets: List[str] = []
+            for row in rows:
+                content = re.sub(r"\s+", " ", row["content"]).strip()[:900]
+                snippets.append(f"Source: {row['title']}\n{content}")
+
+            return "\n\n".join(snippets)
+
         def close(self) -> None:
             self.conn.close()
 
 WEB_LEARNING_DB_PATH = "llm_web_learning.db"
 SELF_IMPROVEMENT_DB_PATH = "llm_self_improvement.db"
 MONDAY_PERSONALITY_FILE = "MOnday personality.txt"
+OLLAMA_SMART_CONTENT_FILE = "Ollama smart content.txt"
 DEFAULT_KNOWLEDGE_FOLDER = "knowledge"
+DEFAULT_PRINCESS_PROTOCOL_FOLDER = "Princess protocol"
+DEFAULT_AUTO_KNOWLEDGE_FOLDERS = (DEFAULT_KNOWLEDGE_FOLDER, DEFAULT_PRINCESS_PROTOCOL_FOLDER)
 SUPPORTED_KNOWLEDGE_EXTENSIONS = {
     ".txt",
     ".md",
+    ".docx",
     ".py",
     ".json",
     ".yaml",
@@ -353,6 +404,8 @@ SUPPORTED_KNOWLEDGE_EXTENSIONS = {
     ".html",
     ".htm",
     ".log",
+    ".typed",
+    "",
 }
 MAX_KNOWLEDGE_FILE_BYTES = 1_000_000
 
@@ -510,6 +563,8 @@ SOURCE_SITES_FILE = "knowledge_sources.json"
 MAX_FEED_ITEMS_PER_SOURCE = 6
 MAX_SITE_PAGES_PER_SOURCE = 10
 MAX_CHAT_LEARNING_CHARS = 6000
+MAX_KNOWLEDGE_CONTEXT_CHARS = 12_000
+MAX_KNOWLEDGE_SNIPPETS_PER_QUERY = 8
 
 
 class PortableLLM:
@@ -538,7 +593,11 @@ class PortableLLM:
             if use_offline_fallback and not self.strict_local_only
             else None
         )
-        self.system_prompt = self._compose_system_prompt(system_prompt, self._load_monday_personality())
+        self.system_prompt = self._compose_system_prompt(
+            system_prompt,
+            self._load_monday_personality(),
+            self._load_ollama_smart_content(),
+        )
         self.web_learner = self._create_web_learner()
         self.improvement_store = SelfImprovementStore()
 
@@ -557,15 +616,21 @@ class PortableLLM:
         )
 
     @staticmethod
-    def _compose_system_prompt(base_prompt: str, personality_prompt: str) -> str:
-        """Combine the base assistant contract with the local Monday personality layer."""
+    def _compose_system_prompt(base_prompt: str, personality_prompt: str, smart_prompt: str) -> str:
+        """Combine the base assistant contract with local personality and Ollama smart guidance."""
+        sections: List[str] = []
         base = (base_prompt or "").strip()
         personality = (personality_prompt or "").strip()
-        if not personality:
-            return base
-        if not base:
-            return personality
-        return f"{base}\n\nPersonality layer:\n{personality}"
+        smart = (smart_prompt or "").strip()
+
+        if base:
+            sections.append(base)
+        if personality:
+            sections.append(f"Personality layer:\n{personality}")
+        if smart:
+            sections.append(f"Ollama smart-response guidance:\n{smart}")
+
+        return "\n\n".join(sections)
 
     @staticmethod
     def _load_monday_personality() -> str:
@@ -603,6 +668,46 @@ class PortableLLM:
             prompt = f"{prompt}\n\n{style_match.group(1).strip()}"
 
         return prompt
+
+    @staticmethod
+    def _load_ollama_smart_content() -> str:
+        """Load the smart Ollama response contract from the companion text file without executing it."""
+        path = Path(__file__).resolve().parent / OLLAMA_SMART_CONTENT_FILE
+        if not path.exists():
+            return ""
+
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Unable to read Ollama smart content file: %s", exc)
+            return ""
+
+        try:
+            tree = ast.parse(raw)
+        except SyntaxError as exc:
+            logger.warning("Unable to parse Ollama smart content file: %s", exc)
+            return raw.strip()
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Attribute) or node.func.attr != "append":
+                continue
+            if not node.args or not isinstance(node.args[0], ast.Dict):
+                continue
+
+            values = {}
+            for key, value in zip(node.args[0].keys, node.args[0].values):
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    try:
+                        values[key.value] = ast.literal_eval(value)
+                    except (ValueError, SyntaxError):
+                        continue
+
+            if values.get("role") == "system" and isinstance(values.get("content"), str):
+                return values["content"].strip()
+
+        return raw.strip()
 
     def available_providers(self) -> List[str]:
         """Return available providers from existing conversation core."""
@@ -861,12 +966,13 @@ class PortableLLM:
             return {"ok": False, "error": "Path is not a folder", "folder": str(root)}
 
         allowed = {
-            ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+            "" if not ext else ext.lower() if ext.startswith(".") else f".{ext.lower()}"
             for ext in (extensions or list(SUPPORTED_KNOWLEDGE_EXTENSIONS))
         }
         files = sorted(root.rglob("*") if recursive else root.glob("*"))
 
         results: List[Dict[str, object]] = []
+        learned_titles: List[str] = []
         successes = 0
         skipped = 0
 
@@ -894,8 +1000,8 @@ class PortableLLM:
                 continue
 
             try:
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
+                content = _read_knowledge_file(path)
+            except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
                 skipped += 1
                 results.append({"ok": False, "path": str(path), "error": str(exc)})
                 continue
@@ -906,9 +1012,11 @@ class PortableLLM:
                 continue
 
             try:
-                title = str(path.relative_to(root))
+                relative_title = str(path.relative_to(root))
             except ValueError:
-                title = path.name
+                relative_title = path.name
+
+            title = f"{root.name}/{relative_title}"
 
             ingest = self.ingest_web_content(url=path.resolve().as_uri(), content=content, title=title)
             ingest["path"] = str(path)
@@ -916,6 +1024,18 @@ class PortableLLM:
             results.append(ingest)
             if ingest.get("ok"):
                 successes += 1
+                learned_titles.append(title)
+
+        if successes > 0:
+            index_content = _build_folder_index_content(root=root, files=files, learned_titles=learned_titles)
+            index_ingest = self.ingest_web_content(
+                url=f"perseus://folder-index/{root.name}",
+                content=index_content,
+                title=f"{root.name}/_folder_index",
+            )
+            index_ingest["path"] = str(root)
+            index_ingest["title"] = f"{root.name}/_folder_index"
+            results.append(index_ingest)
 
         return {
             "ok": successes > 0,
@@ -1102,6 +1222,9 @@ class PortableLLM:
 
     def _enrich_prompt_with_knowledge(self, prompt: str) -> EnrichedPrompt:
         """Inject relevant learned web context into the prompt when available."""
+        if _is_small_talk_prompt(prompt) or _is_capability_prompt(prompt) or _is_general_knowledge_prompt(prompt):
+            return EnrichedPrompt(text=prompt, has_context=False)
+
         if not self.web_learner:
             return EnrichedPrompt(text=prompt, has_context=False)
 
@@ -1123,7 +1246,8 @@ class PortableLLM:
             f"{context}\n\n"
             "Output requirements:\n"
             "1. Start with a realistic summary of what is currently known.\n"
-            "2. Include an 'Ingested Context Used' section with concrete points.\n"
+            "2. Review all retrieved ingested context blocks, synthesize every relevant non-duplicate point, "
+            "and include an 'Ingested Context Used' section with concrete points.\n"
             "3. Include uncertainty where evidence is incomplete.\n"
             "4. Use learned user preferences, prior chat facts, and project context when they are relevant.\n"
             "5. Provide educational explanation and practical implications.\n"
@@ -1135,23 +1259,128 @@ class PortableLLM:
         return EnrichedPrompt(text=enriched_text, has_context=True, context_preview=preview)
 
     def _lookup_knowledge_context(self, prompt: str) -> str:
-        """Try multiple targeted queries so stored knowledge is actually retrieved."""
+        """Try multiple targeted queries and retain as much relevant learned content as the context budget allows."""
         queries = self._knowledge_queries(prompt)
         collected: List[str] = []
         seen = set()
+        remaining_chars = MAX_KNOWLEDGE_CONTEXT_CHARS
+        broad_request = self._requests_broad_knowledge(prompt)
+
+        if broad_request:
+            for snippet in self._split_knowledge_context(self._lookup_all_knowledge_context()):
+                if not snippet or snippet in seen:
+                    continue
+
+                budgeted = snippet[:remaining_chars].strip()
+                if not budgeted:
+                    continue
+
+                collected.append(budgeted)
+                seen.add(snippet)
+                remaining_chars -= len(budgeted) + 2
+                if remaining_chars <= 0:
+                    break
 
         for q in queries:
-            if not q:
+            if not q or remaining_chars <= 0:
                 continue
-            context = self.web_learner.get_knowledge_context_for_query(q)
-            snippet = (context or "").strip()
-            if snippet and snippet not in seen:
-                collected.append(snippet[:1200])
+
+            try:
+                context = self.web_learner.get_knowledge_context_for_query(q, limit=MAX_KNOWLEDGE_SNIPPETS_PER_QUERY)
+            except TypeError:
+                context = self.web_learner.get_knowledge_context_for_query(q)
+
+            for snippet in self._split_knowledge_context(context):
+                if not snippet or snippet in seen:
+                    continue
+
+                budgeted = snippet[:remaining_chars].strip()
+                if not budgeted:
+                    continue
+
+                collected.append(budgeted)
                 seen.add(snippet)
-            if len(collected) >= 3:
+                remaining_chars -= len(budgeted) + 2
+                if remaining_chars <= 0:
+                    break
+
+            if remaining_chars <= 0:
                 break
 
+        if remaining_chars > 0 and not collected:
+            for snippet in self._split_knowledge_context(self._lookup_all_knowledge_context()):
+                if not snippet or snippet in seen:
+                    continue
+
+                budgeted = snippet[:remaining_chars].strip()
+                if not budgeted:
+                    continue
+
+                collected.append(budgeted)
+                seen.add(snippet)
+                remaining_chars -= len(budgeted) + 2
+                if remaining_chars <= 0:
+                    break
+
         return "\n\n".join(collected).strip()
+
+    def _lookup_all_knowledge_context(self) -> str:
+        """Retrieve recent learned source blocks when the prompt calls for broad ingested knowledge."""
+        getter = getattr(self.web_learner, "get_all_knowledge_context", None)
+        if callable(getter):
+            try:
+                return getter(limit=MAX_KNOWLEDGE_SNIPPETS_PER_QUERY)
+            except TypeError:
+                return getter()
+
+        conn = getattr(self.web_learner, "conn", None)
+        if not conn:
+            return ""
+
+        try:
+            rows = conn.execute(
+                """
+                SELECT title, content
+                FROM learned_documents
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (MAX_KNOWLEDGE_SNIPPETS_PER_QUERY,),
+            ).fetchall()
+        except Exception:
+            return ""
+
+        snippets: List[str] = []
+        for row in rows:
+            title = row["title"] if isinstance(row, sqlite3.Row) else row[0]
+            content = row["content"] if isinstance(row, sqlite3.Row) else row[1]
+            normalized = re.sub(r"\s+", " ", str(content or "")).strip()[:900]
+            snippets.append(f"Source: {title}\n{normalized}")
+
+        return "\n\n".join(snippets)
+
+    @staticmethod
+    def _requests_broad_knowledge(prompt: str) -> bool:
+        lower = prompt.lower()
+        broad_markers = [
+            "all ingested",
+            "all learned",
+            "everything ingested",
+            "everything learned",
+            "knowledge base",
+            "learned content",
+            "ingested content",
+        ]
+        return any(marker in lower for marker in broad_markers)
+
+    @staticmethod
+    def _split_knowledge_context(context: str) -> List[str]:
+        """Split returned learner context into source-sized blocks for dedupe and budget handling."""
+        text = (context or "").strip()
+        if not text:
+            return []
+        blocks = [block.strip() for block in re.split(r"\n\s*\n(?=Source: )", text) if block.strip()]
+        return blocks or [text]
 
     @staticmethod
     def _knowledge_queries(prompt: str) -> List[str]:
@@ -1565,6 +1794,8 @@ def launch_portable_llm_chat(
     model: Optional[str] = None,
     strict_local_only: bool = True,
     use_offline_fallback: bool = False,
+    knowledge_folders: Optional[List[str]] = None,
+    auto_ingest_folders: bool = True,
 ) -> None:
     """Launch a desktop chat window for PortableLLM (no terminal loop)."""
     import tkinter as tk
@@ -1579,6 +1810,7 @@ def launch_portable_llm_chat(
         strict_local_only=strict_local_only,
         use_offline_fallback=use_offline_fallback,
     )
+    startup_knowledge_folders = knowledge_folders or list(DEFAULT_AUTO_KNOWLEDGE_FOLDERS)
     result_queue: queue.Queue[Tuple[str, Dict[str, object]]] = queue.Queue()
 
     root = tk.Tk()
@@ -1696,7 +1928,7 @@ def launch_portable_llm_chat(
 
     folder_row = ttk.Frame(ingest_tab)
     folder_row.pack(fill=tk.X, pady=(4, 8))
-    folder_var = tk.StringVar(value=DEFAULT_KNOWLEDGE_FOLDER)
+    folder_var = tk.StringVar(value=startup_knowledge_folders[0] if startup_knowledge_folders else DEFAULT_KNOWLEDGE_FOLDER)
     folder_entry = ttk.Entry(folder_row, textvariable=folder_var)
     folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
@@ -1929,6 +2161,10 @@ def launch_portable_llm_chat(
 
     if auto_ingest_var.get():
         ingest_now()
+    if auto_ingest_folders:
+        for folder_path in startup_knowledge_folders:
+            append_ingest(f"Auto folder ingest started: {folder_path} (recursive=True)")
+            threading.Thread(target=worker_ingest_folder, args=(folder_path, True), daemon=True).start()
 
     root.after(250, show_donation_popup)
 
@@ -1938,6 +2174,363 @@ def launch_portable_llm_chat(
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
+
+
+def launch_portable_llm_terminal_chat(
+    db_path: str = "llm_portable_conversations.db",
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    strict_local_only: bool = True,
+    use_offline_fallback: bool = False,
+    knowledge_folders: Optional[List[str]] = None,
+    auto_ingest_folders: bool = True,
+) -> None:
+    """Launch a terminal chat loop with the same learning and knowledge pipeline as the desktop UI."""
+    llm = PortableLLM(
+        db_path=db_path,
+        provider=provider,
+        model=model,
+        strict_local_only=strict_local_only,
+        use_offline_fallback=use_offline_fallback,
+    )
+    startup_knowledge_folders = knowledge_folders or list(DEFAULT_AUTO_KNOWLEDGE_FOLDERS)
+
+    print(f"Perseus terminal chat ready. Provider={llm.provider} Model={llm.model}")
+    print("Commands: /exit, /quit, /stats, /providers, /ingest <folder>")
+
+    try:
+        if auto_ingest_folders:
+            for folder_path in startup_knowledge_folders:
+                print(f"Auto-ingesting local knowledge folder: {folder_path}")
+                result = llm.ingest_folder(folder_path=folder_path, recursive=True)
+                print(
+                    "  "
+                    f"{result.get('successes', 0)} learned, "
+                    f"{result.get('failures', 0)} failed, "
+                    f"{result.get('skipped', 0)} skipped"
+                )
+
+        while True:
+            try:
+                user_text = input("\nYou> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nBye.")
+                break
+
+            if not user_text:
+                continue
+
+            command = user_text.lower()
+            if command in {"/exit", "/quit", "exit", "quit"}:
+                break
+            if command == "/stats":
+                print(json.dumps(llm.get_stats(), indent=2))
+                continue
+            if command == "/providers":
+                print(", ".join(llm.available_providers()) or "No providers available")
+                continue
+            if command.startswith("/ingest "):
+                folder = user_text.split(" ", 1)[1].strip().strip('"')
+                result = llm.ingest_folder(folder_path=folder, recursive=True)
+                print(json.dumps({k: v for k, v in result.items() if k != "results"}, indent=2))
+                continue
+
+            answer, metadata = llm.ask_with_metadata(user_text)
+            print("\nPerseus>")
+            print(answer)
+            print(
+                "\n"
+                f"[provider={metadata.get('provider')} "
+                f"quality={metadata.get('quality_score')} "
+                f"grounded={metadata.get('grounded_with_ingested_context')}]"
+            )
+    finally:
+        llm.close()
+
+
+def _build_folder_index_content(root: Path, files: List[Path], learned_titles: List[str]) -> str:
+    """Create a searchable index so folder-level concepts retrieve all learned local files."""
+    extension_counts: Dict[str, int] = {}
+    for path in files:
+        if not path.is_file():
+            continue
+        extension = path.suffix.lower() or "<no extension>"
+        extension_counts[extension] = extension_counts.get(extension, 0) + 1
+
+    learned_list = "\n".join(f"- {title}" for title in learned_titles[:500])
+    extension_list = "\n".join(
+        f"- {extension}: {count}" for extension, count in sorted(extension_counts.items())
+    )
+    return (
+        f"Folder knowledge index for {root.name}.\n"
+        f"This folder is part of the local Perseus learning base and should be considered for relevant answers.\n\n"
+        "File type inventory:\n"
+        f"{extension_list}\n\n"
+        "Learned files:\n"
+        f"{learned_list}"
+    )
+
+
+def _extract_user_request(prompt: str) -> str:
+    """Recover the original user request from an enriched prompt when present."""
+    text = (prompt or "").strip()
+    marker = "User request:"
+    if marker in text:
+        return text.rsplit(marker, 1)[1].strip()
+    return text
+
+
+def _capability_response() -> str:
+    """Explain Perseus capabilities when no generative model is available."""
+    return (
+        "I can act like a local ChatGPT-style assistant: chat normally, explain ideas, help with code, "
+        "analyze files, and answer from learned local knowledge. I auto-ingest folders like `knowledge/` "
+        "and `Princess protocol/`, including the Princess Protocol docs and SNAP/MACE source, then use that "
+        "context when it is relevant. I also store useful chat turns as memory and use self-improvement "
+        "signals to make future answers more specific. If Ollama is running, I use the local model for "
+        "full generative responses; otherwise this basic fallback handles simple chat and setup guidance."
+    )
+
+
+def _is_capability_prompt(prompt: str) -> bool:
+    """Return True for prompts asking what the assistant can do."""
+    text = _extract_user_request(prompt)
+    lower = re.sub(r"\s+", " ", text.lower()).strip(" .!?\t\r\n")
+    capability_markers = [
+        "what can you do",
+        "what are your capabilities",
+        "what are you capable of",
+        "tell me what you can do",
+        "how can you help",
+        "what do you do",
+    ]
+    return any(marker in lower for marker in capability_markers)
+
+
+def _is_general_knowledge_prompt(prompt: str) -> bool:
+    """Return True for short general-purpose questions that should not require ingested context."""
+    text = _extract_user_request(prompt)
+    lower = re.sub(r"\s+", " ", text.lower()).strip(" .!?\t\r\n")
+    if not lower:
+        return False
+
+    if _general_knowledge_fallback(lower):
+        return True
+
+    question_starters = (
+        "is ",
+        "are ",
+        "do ",
+        "does ",
+        "can ",
+        "why ",
+        "how ",
+        "what is ",
+        "what are ",
+        "explain ",
+    )
+    domain_markers = [
+        "princess protocol",
+        "snap",
+        "mace",
+        "this project",
+        "ingested",
+        "learned",
+        "knowledge base",
+        "file",
+        "folder",
+        "codebase",
+    ]
+    return lower.startswith(question_starters) and len(lower.split()) <= 12 and not any(
+        marker in lower for marker in domain_markers
+    )
+
+
+def _general_knowledge_fallback(prompt: str) -> str:
+    """Answer common simple questions directly when no model is available."""
+    text = _extract_user_request(prompt)
+    lower = re.sub(r"\s+", " ", text.lower()).strip(" .!?\t\r\n")
+    lower = re.sub(r"\bhte\b", "the", lower)
+
+    if re.fullmatch(r"is\s+[-+]?\d+(\.\d+)?\s+a\s+number", lower):
+        value = re.search(r"[-+]?\d+(\.\d+)?", lower).group(0)
+        return (
+            f"Yes. {value} is a number because it represents a mathematical quantity. "
+            "More specifically, it is a numeral written with digits; in normal arithmetic it can be counted, "
+            "compared, added, subtracted, and used in equations."
+        )
+
+    if "why is water wet" in lower:
+        return (
+            "Water is called wet because it sticks to and spreads across many surfaces. At the molecular level, "
+            "water molecules are polar, so they attract each other through cohesion and attract other materials "
+            "through adhesion. That combination leaves a film of water on things it touches, which we experience "
+            "as wetness. Tiny caveat, because science likes being annoying: water itself is often described as the "
+            "thing that makes other things wet, while a surface is wet when water adheres to it."
+        )
+
+    if "why is the sun hot" in lower or "why sun hot" in lower:
+        return (
+            "The Sun is hot because its core is powered by nuclear fusion. Enormous gravity compresses hydrogen "
+            "so intensely that hydrogen nuclei fuse into helium, releasing energy as radiation. That energy moves "
+            "outward through the Sun and eventually escapes as sunlight and heat. The surface is roughly 5,500 C, "
+            "while the core is millions of degrees because that is where the fusion is happening."
+        )
+
+    if "why do birds fly" in lower or "how do birds fly" in lower:
+        return (
+            "Birds fly because their bodies are built to generate lift while staying light. Their wings are shaped "
+            "so air moves faster over the top than underneath, creating lift; flapping adds thrust; feathers help "
+            "control airflow; and hollow bones plus powerful chest muscles reduce weight and provide power. In simple "
+            "terms: wings create lift, muscles create motion, and the bird's lightweight body makes flight practical."
+        )
+
+    if "why is the sky blue" in lower:
+        return (
+            "The sky looks blue because sunlight scatters in Earth's atmosphere. Blue light has a shorter wavelength "
+            "than red light, so air molecules scatter it more strongly. That scattered blue light reaches your eyes "
+            "from all directions, making the sky appear blue during the day."
+        )
+
+    if "why is grass green" in lower:
+        return (
+            "Grass is green because it contains chlorophyll, the pigment plants use to absorb sunlight for photosynthesis. "
+            "Chlorophyll absorbs red and blue light strongly but reflects more green light, so our eyes see grass as green."
+        )
+
+    if "why is the moon bright" in lower:
+        return (
+            "The Moon looks bright because it reflects sunlight. It does not make its own light like the Sun; its rocky "
+            "surface bounces some sunlight back toward Earth. It can look especially bright because it is close to us, "
+            "contrasts strongly with the dark night sky, and sometimes reflects sunlight from a favorable angle."
+        )
+
+    if lower in {"is water wet", "is water wet or not"}:
+        return (
+            "In everyday language, yes, water is wet. More precisely, water makes other materials wet by adhering "
+            "to their surfaces and forming a liquid film. So the casual answer is yes; the technical answer is that "
+            "wetness describes the interaction between a liquid and a surface."
+        )
+
+    return ""
+
+
+def _heuristic_general_answer(prompt: str) -> str:
+    """Give a useful direct answer for simple general questions outside the learned-context path."""
+    text = _extract_user_request(prompt)
+    lower = re.sub(r"\s+", " ", text.lower()).strip(" .!?\t\r\n")
+    lower = re.sub(r"\bhte\b", "the", lower)
+
+    exist_match = re.fullmatch(r"why (?:do|does) (.+?) exist", lower)
+    if exist_match:
+        subject = exist_match.group(1).strip()
+        if subject in {"chairs", "chair"}:
+            return (
+                "Chairs exist because humans need a stable, comfortable way to rest, work, eat, and gather without "
+                "standing or sitting on the ground. They solve a practical body-design problem: our legs and backs get "
+                "tired, and raising the body to table/desk height makes tasks easier. Over time, chairs also became "
+                "cultural objects - status symbols, design pieces, office tools, and furniture for social spaces."
+            )
+        return (
+            f"{subject.capitalize()} exist because they serve some function, emerge from some cause, or persist because "
+            "they are useful enough to be kept around. A good explanation usually asks: what problem do they solve, "
+            "what conditions made them possible, and why did they continue instead of disappearing?"
+        )
+
+    why_is_match = re.fullmatch(r"why is (.+) ([a-z][a-z-]*)", lower)
+    if why_is_match:
+        subject = why_is_match.group(1).strip()
+        trait = why_is_match.group(2).strip()
+        return (
+            f"{subject.capitalize()} is {trait} because of its underlying properties and the way it interacts with "
+            "its environment. The useful way to break it down is: what it is made of, what forces or processes act on "
+            "it, and what effect those processes create."
+        )
+
+    why_do_match = re.fullmatch(r"why (?:do|does) (.+?) (.+)", lower)
+    if why_do_match:
+        subject = why_do_match.group(1).strip()
+        action = why_do_match.group(2).strip()
+        return (
+            f"{subject.capitalize()} {action} because there is usually a mechanism and a payoff behind the behavior: "
+            "some physical, biological, social, or practical process makes it happen, and the result solves a problem "
+            "or follows naturally from how the thing is built."
+        )
+
+    return (
+        "Short answer: this is a general question, so the best way to answer is to identify the mechanism, the cause, "
+        "and the practical effect. Ask it with a specific subject and I can give a more concrete explanation."
+    )
+
+
+def _is_small_talk_prompt(prompt: str) -> bool:
+    """Return True for conversational prompts that should not require learned context."""
+    text = _extract_user_request(prompt)
+    lower = re.sub(r"\s+", " ", text.lower()).strip(" .!?\t\r\n")
+    if not lower:
+        return False
+
+    small_talk_markers = [
+        "hi",
+        "hello",
+        "hey",
+        "yo",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "how are you",
+        "how are you today",
+        "how's it going",
+        "how is it going",
+        "what's up",
+        "whats up",
+        "thank you",
+        "thanks",
+    ]
+    if lower in small_talk_markers:
+        return True
+
+    if len(lower.split()) > 8:
+        return False
+
+    phrase_markers = [marker for marker in small_talk_markers if " " in marker]
+    if any(marker in lower for marker in phrase_markers):
+        return True
+
+    single_word_markers = [marker for marker in small_talk_markers if " " not in marker]
+    words = set(re.findall(r"[a-z']+", lower))
+    return any(marker in words for marker in single_word_markers)
+
+
+def _read_knowledge_file(path: Path) -> str:
+    """Read a supported local knowledge file into plain text."""
+    if path.suffix.lower() == ".docx":
+        return _extract_docx_text(path)
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _extract_docx_text(path: Path) -> str:
+    """Extract readable text from a Word .docx file without external dependencies."""
+    with zipfile.ZipFile(path) as archive:
+        try:
+            document_xml = archive.read("word/document.xml")
+        except KeyError as exc:
+            raise RuntimeError("DOCX is missing word/document.xml") from exc
+
+    try:
+        root = ET.fromstring(document_xml)
+    except ET.ParseError as exc:
+        raise RuntimeError(f"Unable to parse DOCX XML: {exc}") from exc
+
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    paragraphs: List[str] = []
+    for paragraph in root.findall(".//w:p", namespace):
+        parts = [node.text or "" for node in paragraph.findall(".//w:t", namespace)]
+        text = "".join(parts).strip()
+        if text:
+            paragraphs.append(text)
+
+    return "\n".join(paragraphs)
 
 
 def _strip_html_to_text(html: str) -> str:

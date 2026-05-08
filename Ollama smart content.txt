@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""
+Local Smart Chat Assistant
+- No API key
+- Uses Ollama locally
+- Keeps short conversation memory
+- Adds "educated response" prompting
+"""
+
+from __future__ import annotations
+
+import json
+import requests
+from dataclasses import dataclass, field
+from typing import List, Dict
+from rich.console import Console
+from rich.markdown import Markdown
+
+OLLAMA_URL = "http://localhost:11434/api/chat"
+
+
+@dataclass
+class LocalSmartChat:
+    model: str = "llama3.2"
+    max_history: int = 12
+    temperature: float = 0.45
+    messages: List[Dict[str, str]] = field(default_factory=list)
+
+    def __post_init__(self):
+        self.messages.append({
+            "role": "system",
+            "content": (
+                "You are Monday, a sharp, practical, skeptical assistant. "
+                "Give smart, educated, useful answers. "
+                "Be candid, concise, and explain reasoning clearly. "
+                "Use dry humor lightly. "
+                "If unsure, say what is uncertain and what would verify it. "
+                "Avoid fake confidence, filler, and hollow praise. "
+                "For technical questions, give practical steps, risks, and examples."
+            )
+        })
+
+    def trim_history(self):
+        system = self.messages[0]
+        recent = self.messages[-self.max_history:]
+        self.messages = [system] + [m for m in recent if m["role"] != "system"]
+
+    def ask(self, user_input: str) -> str:
+        self.messages.append({"role": "user", "content": user_input})
+        self.trim_history()
+
+        payload = {
+            "model": self.model,
+            "messages": self.messages,
+            "stream": False,
+            "options": {
+                "temperature": self.temperature,
+                "top_p": 0.9,
+                "num_ctx": 4096
+            }
+        }
+
+        try:
+            response = requests.post(OLLAMA_URL, json=payload, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+            answer = data["message"]["content"].strip()
+        except requests.exceptions.ConnectionError:
+            answer = (
+                "Ollama is not running. Start it first with:\n\n"
+                "`ollama serve`\n\n"
+                "Yes, the local brain needs to be awake. Shocking."
+            )
+        except Exception as e:
+            answer = f"Error talking to local model: {e}"
+
+        self.messages.append({"role": "assistant", "content": answer})
+        return answer
+
+
+def main():
+    console = Console()
+    bot = LocalSmartChat()
+
+    console.print("[bold cyan]Monday Local Chat[/bold cyan]")
+    console.print("Type [bold]exit[/bold], [bold]quit[/bold], or [bold]clear[/bold].\n")
+
+    while True:
+        try:
+            user_input = input("You> ").strip()
+        except KeyboardInterrupt:
+            print("\nBye.")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.lower() in {"exit", "quit"}:
+            break
+
+        if user_input.lower() == "clear":
+            bot = LocalSmartChat()
+            console.print("[yellow]Conversation cleared.[/yellow]")
+            continue
+
+        answer = bot.ask(user_input)
+        console.print("\n[bold magenta]Monday>[/bold magenta]")
+        console.print(Markdown(answer))
+        console.print()
+
+
+if __name__ == "__main__":
+    main()

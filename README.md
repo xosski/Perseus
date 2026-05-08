@@ -33,11 +33,67 @@ This folder provides a standard, portable LLM layer built using the existing Had
 
 ## Quick Start
 
-Run CLI chat:
+Run desktop chat:
 
 ```bash
 python cli.py
 ```
+
+Run terminal chat:
+
+```bash
+python cli.py --terminal
+```
+
+## Ollama Setup
+
+Perseus is designed to use Ollama as the default local LLM provider. Ollama must be running **and** at least one model must be installed. If Ollama is running but has no models, Perseus will fall back to its basic local fallback responses.
+
+1. Install Ollama from <https://ollama.com/download>.
+2. Start the Ollama server:
+
+```bash
+ollama serve
+```
+
+3. In a second terminal, install a model:
+
+```bash
+ollama pull llama3.2
+```
+
+If your machine is low on RAM, try a smaller model:
+
+```bash
+ollama pull qwen2.5:1.5b
+```
+
+4. Confirm Ollama sees the model:
+
+```bash
+ollama list
+```
+
+5. Launch Perseus with the matching model:
+
+```bash
+python cli.py --terminal --provider ollama --model llama3.2
+```
+
+or, for the smaller model:
+
+```bash
+python cli.py --terminal --provider ollama --model qwen2.5:1.5b
+```
+
+### Ollama Troubleshooting
+
+- `Provider=fallback` means Perseus did not find a usable local Ollama model.
+- `HTTP Error 404` from Ollama usually means the requested model name is not installed. Run `ollama list`, then pass the exact installed model name with `--model`.
+- If `ollama list` is empty, install a model with `ollama pull llama3.2` or `ollama pull qwen2.5:1.5b`.
+- If Ollama is not reachable, start it with `ollama serve`.
+- In strict local-only mode, remote/cloud providers are blocked, so a missing Ollama model will use the built-in fallback instead of an online LLM.
+- The built-in fallback can answer simple chat and some basic general questions, but full ChatGPT-style arbitrary responses require an installed Ollama model.
 
 Choose provider explicitly:
 
@@ -93,8 +149,8 @@ llm.close()
 - The desktop UI has a `Knowledge Ingest` tab for source-site ingestion, manual URL ingestion, and local folder ingestion
 - The source-site list is stored in `knowledge_sources.json`; edit it in the UI or directly as JSON
 - Source sites can be RSS/Atom feeds or normal websites; normal websites are scanned for a bounded number of same-site links
-- The included default local folder path is `knowledge`; drop files there or use the Browse button to choose another folder
-- Folder ingestion is recursive by default and supports `.txt`, `.md`, `.py`, `.json`, `.yaml`, `.yml`, `.csv`, `.html`, `.htm`, and `.log` files
+- The default startup local folders are `knowledge` and `Princess protocol`; use `--knowledge-folder` to override or `--no-auto-ingest-folders` to disable startup folder ingestion
+- Folder ingestion is recursive by default and supports `.txt`, `.md`, `.docx`, `.py`, `.json`, `.yaml`, `.yml`, `.csv`, `.html`, `.htm`, `.log`, `.typed`, and no-extension text files
 - Individual local files larger than 1 MB are skipped to keep ingestion responsive
 - User chat turns are learned into the same `llm_web_learning.db` store as `perseus://chat-memory/...` records
 - Source ingest reports both source success and linked page/article success counts
