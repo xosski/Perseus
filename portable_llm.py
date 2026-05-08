@@ -62,6 +62,9 @@ class PromptProfile:
     complexity: str
     mood: str
     expected_shape: str
+    prefer_structure: bool
+    prefer_concise: bool
+    conversational: bool
 
 
 @dataclass
@@ -600,9 +603,32 @@ class PortableLLM:
 
         complexity = "high" if len(words) > 20 or any(t in lower for t in ["architecture", "constraints", "production", "distributed"]) else "normal"
         mood = "analytical" if intent in {"technical", "analytical"} else "pragmatic"
-        expected_shape = "structured" if intent in {"technical", "strategic", "analytical"} else "didactic"
+        conversational_markers = ["chat", "talk", "casual", "normal", "plain english", "simple terms"]
+        concise_markers = ["brief", "short", "concise", "tldr", "quick answer", "one-liner", "one line"]
+        structured_markers = ["steps", "plan", "outline", "table", "bullet", "checklist", "roadmap", "compare"]
 
-        return PromptProfile(intent=intent, complexity=complexity, mood=mood, expected_shape=expected_shape)
+        prefer_concise = any(marker in lower for marker in concise_markers)
+        prefer_structure = any(marker in lower for marker in structured_markers) or intent in {"strategic", "analytical"}
+        conversational = any(marker in lower for marker in conversational_markers) or not prefer_structure
+
+        if prefer_structure:
+            expected_shape = "structured"
+        elif prefer_concise:
+            expected_shape = "concise"
+        elif conversational:
+            expected_shape = "conversational"
+        else:
+            expected_shape = "didactic"
+
+        return PromptProfile(
+            intent=intent,
+            complexity=complexity,
+            mood=mood,
+            expected_shape=expected_shape,
+            prefer_structure=prefer_structure,
+            prefer_concise=prefer_concise,
+            conversational=conversational,
+        )
 
     def _provider_candidates(self) -> List[str]:
         """Rank providers for this request, preserving selected primary first."""
@@ -713,18 +739,32 @@ class PortableLLM:
         prior_response: Optional[str],
     ) -> List[Dict[str, str]]:
         """Create API-formatted messages with adaptive instructions and short memory."""
-        response_contract = (
-            "Respond with explicit sections: Summary, Reasoning, and Next Steps. "
-            "Use precise language and avoid filler. "
-            "If uncertain, state assumptions and what data is needed. "
+        response_contract = [
+            "Respond like a capable general-purpose assistant: natural, clear, and directly useful.",
+            "Match the user's tone and requested depth.",
+            "If uncertain, state assumptions and what data is needed.",
+        ]
+
+        if profile.prefer_structure:
+            response_contract.append(
+                "Use structured formatting (sections or bullets) when it improves clarity, including concrete next steps."
+            )
+        elif profile.prefer_concise:
+            response_contract.append("Keep the answer concise while still being specific and accurate.")
+        else:
+            response_contract.append(
+                "Default to natural prose; add light structure only when it helps readability."
+            )
+
+        response_contract.append(
             "If ingested web context is present in the prompt, include a short 'Ingested Context Used' section "
-            "that cites concrete facts from that context."
+            "with concrete facts from that context."
         )
 
         system = (
             f"{self.system_prompt}\n"
             f"Mode: {profile.intent}. Complexity target: {profile.complexity}. Output shape: {profile.expected_shape}.\n"
-            f"{response_contract}"
+            f"{' '.join(response_contract)}"
         )
 
         learned_guidance = self.improvement_store.guidance_for_intent(profile.intent)
@@ -778,10 +818,13 @@ class PortableLLM:
             "i do not have access",
         ]
 
-        if len(text) < 90:
+        min_len = 60 if profile.prefer_concise else 90
+        brief_len = 110 if profile.prefer_concise else 150
+
+        if len(text) < min_len:
             score -= 30
             reasons.append("Too short for an educated response")
-        elif len(text) < 150:
+        elif len(text) < brief_len:
             score -= 12
             reasons.append("Response is brief for sophisticated depth")
 
@@ -789,20 +832,25 @@ class PortableLLM:
             score -= 35
             reasons.append("Contains generic low-value fallback phrasing")
 
-        if profile.intent in {"technical", "strategic", "analytical"}:
+        if profile.prefer_structure or profile.intent in {"strategic", "analytical"}:
             has_structure = any(token in text for token in ["\n-", "\n1.", ":\n", "##"])
             if not has_structure:
-                score -= 12
+                score -= 8
                 reasons.append("Missing structured presentation")
 
             if "next steps" not in lower:
-                score -= 10
+                score -= 6
                 reasons.append("Missing actionable next steps")
 
             reasoning_signals = ["because", "therefore", "trade-off", "risk", "assumption"]
             if not any(marker in lower for marker in reasoning_signals):
                 score -= 8
                 reasons.append("Limited explicit reasoning depth")
+        elif profile.intent == "technical":
+            technical_signals = ["for example", "because", "in practice", "trade-off", "risk"]
+            if not any(marker in lower for marker in technical_signals):
+                score -= 4
+                reasons.append("Could use slightly more practical reasoning")
 
         if "?" in text and len(text) < 140:
             score -= 8
