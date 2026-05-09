@@ -12,6 +12,7 @@ This folder provides a standard, portable LLM layer built using the existing Had
 ## Response Sophistication
 
 - Intent profiling for each prompt (`technical`, `educational`, `strategic`, `analytical`, `feedback`)
+- Question decomposition that reasons through relevant `who`, `what`, `when`, `where`, `why`, and `how` dimensions before answering
 - Adaptive prompt contracts that favor candid, genuine feedback with clear reasoning and next steps
 - Response quality scoring that penalizes short, generic, flattering, unstructured, or low-reasoning answers
 - Single-pass response refinement when initial output quality is low

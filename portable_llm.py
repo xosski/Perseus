@@ -8,6 +8,7 @@ Uses the existing architecture:
 Enhancements in this module:
 - Prompt intent profiling (technical, educational, strategic, analytical)
 - Adaptive system prompting contracts
+- Question anatomy: infer who/what/when/where/why/how before answering
 - Lightweight response quality scoring
 - Single-pass refinement for weak drafts
 - Multi-provider failover before offline fallback
@@ -580,6 +581,8 @@ class PortableLLM:
         system_prompt: str = (
             "You are Perseus, a smart, practical technical assistant. "
             "Provide accurate, genuine, context-aware responses with candid, intelligent feedback. "
+            "When the user asks a question, infer the relevant who, what, when, where, why, and how dimensions, "
+            "then synthesize a direct answer with mechanism, context, implications, and next steps when useful. "
             "Act as the user's personal knowledge assistant: prefer learned source material, local files, "
             "ingested context, and relevant user-provided chat knowledge over sending the user to browse manually. "
             "Avoid hollow praise, filler, and generic disclaimers; be useful, honest, and actionable."
@@ -1415,7 +1418,22 @@ class PortableLLM:
             intent = "analytical"
         elif any(token in lower for token in ["plan", "strategy", "roadmap", "prioritize", "recommend"]):
             intent = "strategic"
-        elif any(token in lower for token in ["teach", "explain", "what is", "how does", "why"]):
+        elif any(
+            token in lower
+            for token in [
+                "teach",
+                "explain",
+                "what is",
+                "what are",
+                "who ",
+                "when ",
+                "where ",
+                "how does",
+                "how do",
+                "how can",
+                "why",
+            ]
+        ):
             intent = "educational"
         else:
             intent = "technical"
@@ -1562,6 +1580,8 @@ class PortableLLM:
         """Create API-formatted messages with adaptive instructions and short memory."""
         response_contract = [
             "Respond like a capable general-purpose assistant: natural, thoughtful, clear, and directly useful.",
+            "For every question, first reason internally about the relevant who, what, when, where, why, and how; answer only the dimensions that matter.",
+            "Prefer synthesis over trivia: explain the core mechanism, context, consequences, trade-offs, and practical implications.",
             "Match the user's tone and requested depth.",
             "Give genuine feedback: identify what is strong, what is weak, why it matters, and what to do next.",
             "Do not flatter, over-agree, or pad the answer; be candid without being harsh.",
@@ -2323,6 +2343,14 @@ def _is_general_knowledge_prompt(prompt: str) -> bool:
         "do ",
         "does ",
         "can ",
+        "could ",
+        "should ",
+        "would ",
+        "who ",
+        "when ",
+        "where ",
+        "which ",
+        "what ",
         "why ",
         "how ",
         "what is ",
@@ -2341,7 +2369,7 @@ def _is_general_knowledge_prompt(prompt: str) -> bool:
         "folder",
         "codebase",
     ]
-    return lower.startswith(question_starters) and len(lower.split()) <= 12 and not any(
+    return lower.startswith(question_starters) and len(lower.split()) <= 24 and not any(
         marker in lower for marker in domain_markers
     )
 
@@ -2431,35 +2459,157 @@ def _heuristic_general_answer(prompt: str) -> str:
                 "tired, and raising the body to table/desk height makes tasks easier. Over time, chairs also became "
                 "cultural objects - status symbols, design pieces, office tools, and furniture for social spaces."
             )
-        return (
-            f"{subject.capitalize()} exist because they serve some function, emerge from some cause, or persist because "
-            "they are useful enough to be kept around. A good explanation usually asks: what problem do they solve, "
-            "what conditions made them possible, and why did they continue instead of disappearing?"
+        return _compose_question_answer(
+            focus=subject,
+            direct_answer=(
+                f"{subject.capitalize()} exist because they either solve a problem, emerge from a cause, or persist "
+                "because people, systems, or environments keep selecting for them."
+            ),
+            why="They continue when their usefulness, incentives, or natural causes outweigh the cost of removing them.",
+            how="To explain them well, identify the need they satisfy, the conditions that made them possible, and the feedback loop that keeps them around.",
+            what="The key object of analysis is not just the thing itself, but the function or pressure behind it.",
         )
 
     why_is_match = re.fullmatch(r"why is (.+) ([a-z][a-z-]*)", lower)
     if why_is_match:
         subject = why_is_match.group(1).strip()
         trait = why_is_match.group(2).strip()
-        return (
-            f"{subject.capitalize()} is {trait} because of its underlying properties and the way it interacts with "
-            "its environment. The useful way to break it down is: what it is made of, what forces or processes act on "
-            "it, and what effect those processes create."
+        return _compose_question_answer(
+            focus=subject,
+            direct_answer=(
+                f"{subject.capitalize()} is {trait} because some underlying property, process, or context produces "
+                f"that {trait} effect."
+            ),
+            why="The cause usually sits one layer deeper than the description: material, structure, incentive, biology, physics, or social convention.",
+            how="Break it into inputs, mechanism, and visible result: what acts on it, how it changes, and what you observe.",
+            what=f"The trait to explain is `{trait}`; the useful answer should separate appearance from mechanism.",
         )
 
     why_do_match = re.fullmatch(r"why (?:do|does) (.+?) (.+)", lower)
     if why_do_match:
         subject = why_do_match.group(1).strip()
         action = why_do_match.group(2).strip()
-        return (
-            f"{subject.capitalize()} {action} because there is usually a mechanism and a payoff behind the behavior: "
-            "some physical, biological, social, or practical process makes it happen, and the result solves a problem "
-            "or follows naturally from how the thing is built."
+        return _compose_question_answer(
+            focus=subject,
+            direct_answer=(
+                f"{subject.capitalize()} {action} because a mechanism enables it and some pressure, payoff, or cause "
+                "makes it happen repeatedly."
+            ),
+            why="The reason is usually a mix of cause and function: what triggers the behavior, and what result it produces.",
+            how="Look for the mechanism: physical forces, biological structures, incentives, rules, tools, or habits that make the action possible.",
+            what=f"The behavior to explain is `{action}`; a strong answer should connect cause -> mechanism -> outcome.",
         )
 
+    question_match = re.fullmatch(r"(who|what|when|where|why|how|which)\s+(.+)", lower)
+    if question_match:
+        question_word = question_match.group(1)
+        raw_focus = question_match.group(2).strip()
+        focus = _normalize_question_focus(question_word, raw_focus)
+        return _compose_question_answer(
+            focus=focus,
+            direct_answer=_direct_heuristic_answer(question_word, focus, raw_focus),
+            who="Identify the actor, owner, decision-maker, affected group, or source of authority involved.",
+            what="Define the object precisely before judging it; vague nouns usually create vague answers.",
+            when="Time matters if the answer depends on sequence, deadlines, history, version, or changing conditions.",
+            where="Place matters if jurisdiction, environment, deployment target, market, or physical context changes the answer.",
+            why="The deeper value is the cause, incentive, risk, or purpose behind the surface fact.",
+            how="A sophisticated answer connects the mechanism to practical consequences: what causes what, and what to do with that information.",
+        )
+
+    return _compose_question_answer(
+        focus=lower or "the question",
+        direct_answer=(
+            "The intelligent way to answer this is to define the subject, identify the mechanism, separate facts from assumptions, "
+            "and then explain why the answer matters in practice."
+        ),
+        what="Clarify the exact subject and the decision or curiosity behind it.",
+        why="The purpose of the question determines whether the answer should be factual, strategic, diagnostic, or explanatory.",
+        how="Once the goal is clear, answer by connecting evidence -> mechanism -> implication -> next action.",
+    )
+
+
+def _normalize_question_focus(question_word: str, focus: str) -> str:
+    """Remove leading auxiliaries so fallback answers discuss the actual topic."""
+    cleaned = focus.rstrip("?").strip()
+    cleaned = re.sub(r"^(?:do|does|did|is|are|was|were|can|could|should|would)\s+", "", cleaned)
+    cleaned = re.sub(r"^(?:i|we|you|they)\s+", "", cleaned)
+    if question_word == "how" and cleaned.endswith(" work"):
+        cleaned = cleaned[: -len(" work")].strip()
+    if question_word == "where" and cleaned.startswith("do "):
+        cleaned = cleaned[3:].strip()
+    return cleaned or focus.strip() or "the question"
+
+
+def _direct_heuristic_answer(question_word: str, focus: str, raw_focus: str = "") -> str:
+    """Create a cautious direct answer when the fallback has no factual knowledge base for the topic."""
+    cleaned = focus.rstrip("?").strip()
+    raw = raw_focus.lower()
+    if question_word == "who" and "invented the telephone" in cleaned:
+        return (
+            "Alexander Graham Bell is commonly credited with inventing and patenting the practical telephone in 1876, "
+            "though the broader story includes competing inventors and contributors such as Elisha Gray and Antonio Meucci."
+        )
+    if question_word == "who":
+        return (
+            f"For `{cleaned}`, the useful first move is to identify the relevant person, group, institution, or role, "
+            "then verify it against a primary source before treating it as fact."
+        )
+    if question_word == "when":
+        if raw.startswith("should") or raw.startswith("could") or raw.startswith("would"):
+            return (
+                f"For `{cleaned}`, the answer is conditional: do it when the benefit is clear, the constraints are understood, "
+                "and the downside is manageable."
+            )
+        return (
+            f"For `{cleaned}`, the answer depends on the timeline: origin, trigger point, deadline, and whether the date changes by location or version."
+        )
+    if question_word == "where":
+        return (
+            f"For `{cleaned}`, the important location may be physical, legal, technical, or organizational; the context can change the answer."
+        )
+    if question_word == "how":
+        return (
+            f"For `{cleaned}`, focus on the mechanism: inputs, process, constraints, output, and failure modes."
+        )
+    if question_word == "why":
+        return (
+            f"For `{cleaned}`, the best answer should identify the underlying cause, incentive, or purpose rather than only describing the surface fact."
+        )
     return (
-        "Short answer: this is a general question, so the best way to answer is to identify the mechanism, the cause, "
-        "and the practical effect. Ask it with a specific subject and I can give a more concrete explanation."
+        f"For `{cleaned}`, start by defining the subject precisely, then separate known facts, assumptions, implications, and useful next actions."
+    )
+
+
+def _compose_question_answer(
+    focus: str,
+    direct_answer: str,
+    who: str = "",
+    what: str = "",
+    when: str = "",
+    where: str = "",
+    why: str = "",
+    how: str = "",
+) -> str:
+    """Format fallback answers with explicit question decomposition and synthesis."""
+    dimensions = [
+        ("Who", who),
+        ("What", what),
+        ("When", when),
+        ("Where", where),
+        ("Why", why),
+        ("How", how),
+    ]
+    relevant = [(label, value) for label, value in dimensions if value]
+    dimension_lines = "\n".join(f"- {label}: {value}" for label, value in relevant)
+    if not dimension_lines:
+        dimension_lines = "- Why: Identify the cause or purpose.\n- How: Explain the mechanism and practical effect."
+
+    return (
+        f"Direct answer: {direct_answer}\n\n"
+        f"Question anatomy for `{focus}`:\n"
+        f"{dimension_lines}\n\n"
+        "Synthesis: a sophisticated answer should not stop at the surface fact. It should connect cause, mechanism, context, "
+        "and implication so you know not just the answer, but how to reason about it and what to do next."
     )
 
 

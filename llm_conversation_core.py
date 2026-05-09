@@ -475,6 +475,13 @@ class FallbackProvider(LLMProviderBase):
                 "Grass is green because chlorophyll absorbs red and blue light for photosynthesis but reflects more "
                 "green light, which is what your eyes see."
             )
+
+        general_question = re.fullmatch(
+            r"\s*(who|what|when|where|why|how|which|should|could|would|can|do|does|is|are)\s+(.+?)\??\s*",
+            prompt_lower,
+        )
+        if general_question and len(prompt_lower.split()) <= 24:
+            return self._question_fallback(general_question.group(1), general_question.group(2))
         
         for key, value in self.responses.items():
             if key in prompt_lower:
@@ -493,6 +500,54 @@ class FallbackProvider(LLMProviderBase):
 
         # Default response
         return "I'm ready to help. Tell me your goal and the file or directory you want to work on."
+
+    @staticmethod
+    def _question_fallback(question_word: str, focus: str) -> str:
+        """Answer simple questions by decomposing who/what/when/where/why/how instead of giving a flat refusal."""
+        raw_focus = focus.strip(" .!?\t\r\n")
+        focus = re.sub(r"^(?:do|does|did|is|are|was|were|can|could|should|would)\s+", "", raw_focus)
+        focus = re.sub(r"^(?:i|we|you|they)\s+", "", focus) or raw_focus or "the question"
+        if question_word == "how" and focus.endswith(" work"):
+            focus = focus[: -len(" work")].strip()
+
+        if question_word == "who" and "invented the telephone" in focus:
+            direct = (
+                "Alexander Graham Bell is commonly credited with inventing and patenting the practical telephone in 1876, "
+                "though the broader story includes competing inventors and contributors such as Elisha Gray and Antonio Meucci."
+            )
+        elif question_word == "who":
+            direct = (
+                f"For `{focus}`, identify the relevant person, group, institution, or role, then verify it against a "
+                "primary source before treating it as fact."
+            )
+        elif question_word == "when":
+            if raw_focus.startswith(("should", "could", "would")):
+                direct = (
+                    f"For `{focus}`, the answer is conditional: do it when the benefit is clear, the constraints are understood, "
+                    "and the downside is manageable."
+                )
+            else:
+                direct = f"For `{focus}`, the answer depends on the timeline: origin, trigger, deadline, and whether timing varies by context."
+        elif question_word == "where":
+            direct = f"For `{focus}`, location may be physical, legal, technical, or organizational, so context can change the answer."
+        elif question_word == "how":
+            direct = f"For `{focus}`, focus on the mechanism: inputs, process, constraints, output, and failure modes."
+        elif question_word == "why":
+            direct = f"For `{focus}`, the best answer should identify the cause, incentive, or purpose behind the surface fact."
+        else:
+            direct = f"For `{focus}`, define the subject precisely, separate facts from assumptions, then explain the practical implication."
+
+        return (
+            f"Direct answer: {direct}\n\n"
+            f"Question anatomy for `{focus}`:\n"
+            "- Who: identify the actors, owners, sources of authority, or affected groups.\n"
+            "- What: define the exact object or claim before judging it.\n"
+            "- When: check whether timing, sequence, history, version, or deadlines matter.\n"
+            "- Where: check whether place, jurisdiction, environment, or deployment context changes the answer.\n"
+            "- Why: identify the cause, incentive, risk, or purpose.\n"
+            "- How: connect mechanism to consequence and next action.\n\n"
+            "Synthesis: a sophisticated answer should connect context, mechanism, and implication so the response is useful, not just verbal."
+        )
     
     def generate_stream(self, prompt: str, **kwargs) -> Iterator[str]:
         response = self.generate(prompt, **kwargs)
