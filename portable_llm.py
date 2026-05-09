@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from html import unescape
+import importlib.machinery
+import importlib.util
 import json
 import logging
 from pathlib import Path
@@ -33,7 +35,8 @@ from typing import Dict, List, Optional, Tuple
 from urllib.error import URLError
 from urllib.parse import urldefrag, urljoin, urlparse
 from urllib.request import Request, urlopen
-
+import hashlib
+from typing import List, Dict, Optional
 try:
     from llm_conversation_core import ConversationManager
     from offline_llm import OfflineLLM
@@ -393,6 +396,13 @@ OLLAMA_SMART_CONTENT_FILE = "Ollama smart content.txt"
 DEFAULT_KNOWLEDGE_FOLDER = "knowledge"
 DEFAULT_PRINCESS_PROTOCOL_FOLDER = "Princess protocol"
 DEFAULT_AUTO_KNOWLEDGE_FOLDERS = (DEFAULT_KNOWLEDGE_FOLDER, DEFAULT_PRINCESS_PROTOCOL_FOLDER)
+MODULES_FOLDER = "Modules"
+PREDICTIVE_LEARNING_MODULE_FILE = "Predictive learning.txt"
+ASYNCHRONOUS_LEARNING_MODULE_FILE = "Asyncronous Learning.txt"
+COGNITIVE_FUNCTIONS_MODULE_FILE = "Cognitive Functions.txt"
+PREDICTIVE_LEARNING_DB_PATH = "predictive_learning_memory.db"
+ECHOWIRING_MEMORY_DB_PATH = "ghostcore_echowiring_memory.db"
+COGNITIVE_STATE_DB_PATH = "ghostcore_cognitive_state.db"
 SUPPORTED_KNOWLEDGE_EXTENSIONS = {
     ".txt",
     ".md",
@@ -408,6 +418,380 @@ SUPPORTED_KNOWLEDGE_EXTENSIONS = {
     ".typed",
     "",
 }
+DB_PATH = "ghostcore_echowiring_memory.db"
+
+
+class EchoWiringMemory:
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS learning_events (
+                id TEXT PRIMARY KEY,
+                who TEXT,
+                when_utc TEXT,
+                what TEXT,
+                why TEXT,
+                context TEXT,
+                outcome TEXT,
+                lesson TEXT,
+                confidence REAL,
+                tags TEXT,
+
+                -- AMM / EchoWiring fields
+                amm_enabled INTEGER,
+                consent_confirmed INTEGER,
+                audio_cue TEXT,
+                rhythm_pattern TEXT,
+                emotional_tone TEXT,
+                recall_phrase TEXT,
+                stress_context TEXT,
+                safety_notes TEXT
+            )
+            """)
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS patterns (
+                id TEXT PRIMARY KEY,
+                pattern_name TEXT,
+                description TEXT,
+                evidence TEXT,
+                prediction TEXT,
+                confidence REAL,
+                created_utc TEXT,
+                updated_utc TEXT,
+                tags TEXT
+            )
+            """)
+
+            conn.commit()
+
+    def _make_id(self, payload: str) -> str:
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    def add_event(
+        self,
+        who: str,
+        what: str,
+        why: str,
+        context: str = "",
+        outcome: str = "",
+        lesson: str = "",
+        confidence: float = 0.5,
+        tags: Optional[List[str]] = None,
+
+        # EchoWiring / AMM fields
+        amm_enabled: bool = False,
+        consent_confirmed: bool = False,
+        audio_cue: str = "",
+        rhythm_pattern: str = "",
+        emotional_tone: str = "",
+        recall_phrase: str = "",
+        stress_context: str = "",
+        safety_notes: str = ""
+    ) -> str:
+        """
+        Adds a memory event.
+
+        AMM is only allowed when consent_confirmed=True.
+        This keeps the system aligned with the EchoWiring ethical rule:
+        no covert memory shaping.
+        """
+
+        if amm_enabled and not consent_confirmed:
+            raise ValueError(
+                "AMM/EchoWiring cannot be enabled without confirmed consent."
+            )
+
+        when_utc = datetime.now(timezone.utc).isoformat()
+        tags = tags or []
+
+        raw = f"{who}|{when_utc}|{what}|{why}|{context}|{outcome}|{audio_cue}|{recall_phrase}"
+        event_id = self._make_id(raw)
+
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+            INSERT OR REPLACE INTO learning_events (
+                id, who, when_utc, what, why, context, outcome, lesson,
+                confidence, tags,
+                amm_enabled, consent_confirmed, audio_cue, rhythm_pattern,
+                emotional_tone, recall_phrase, stress_context, safety_notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                event_id,
+                who,
+                when_utc,
+                what,
+                why,
+                context,
+                outcome,
+                lesson,
+                confidence,
+                json.dumps(tags),
+
+                int(amm_enabled),
+                int(consent_confirmed),
+                audio_cue,
+                rhythm_pattern,
+                emotional_tone,
+                recall_phrase,
+                stress_context,
+                safety_notes
+            ))
+
+            conn.commit()
+
+        return event_id
+
+    def add_pattern(
+        self,
+        pattern_name: str,
+        description: str,
+        evidence: str,
+        prediction: str,
+        confidence: float,
+        tags: Optional[List[str]] = None
+    ) -> str:
+        now = datetime.now(timezone.utc).isoformat()
+        tags = tags or []
+
+        raw = f"{pattern_name}|{description}|{prediction}"
+        pattern_id = self._make_id(raw)
+
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+            INSERT OR REPLACE INTO patterns (
+                id, pattern_name, description, evidence, prediction,
+                confidence, created_utc, updated_utc, tags
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                pattern_id,
+                pattern_name,
+                description,
+                evidence,
+                prediction,
+                confidence,
+                now,
+                now,
+                json.dumps(tags)
+            ))
+            conn.commit()
+
+        return pattern_id
+
+    def search_events(self, query: str, limit: int = 8) -> List[Dict]:
+        """
+        Simple keyword search.
+        Can later be replaced with vector embeddings.
+        """
+
+        terms = [term.lower() for term in query.split() if term.strip()]
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM learning_events ORDER BY when_utc DESC")
+            rows = cur.fetchall()
+
+        scored = []
+
+        for row in rows:
+            item = dict(row)
+
+            searchable_text = " ".join([
+                item.get("who") or "",
+                item.get("what") or "",
+                item.get("why") or "",
+                item.get("context") or "",
+                item.get("outcome") or "",
+                item.get("lesson") or "",
+                item.get("tags") or "",
+                item.get("audio_cue") or "",
+                item.get("rhythm_pattern") or "",
+                item.get("emotional_tone") or "",
+                item.get("recall_phrase") or "",
+                item.get("stress_context") or "",
+                item.get("safety_notes") or ""
+            ]).lower()
+
+            score = sum(1 for term in terms if term in searchable_text)
+
+            if score > 0:
+                item["score"] = score
+                item["tags"] = json.loads(item.get("tags") or "[]")
+                scored.append(item)
+
+        scored.sort(key=lambda x: (x["score"], x["when_utc"]), reverse=True)
+        return scored[:limit]
+
+    def predict_from_context(self, current_context: str, limit: int = 5) -> Dict:
+        related_events = self.search_events(current_context, limit=limit)
+
+        if not related_events:
+            return {
+                "prediction": "No strong prior memory pattern found.",
+                "confidence": 0.1,
+                "relevant_lessons": [],
+                "amm_recall_cues": [],
+                "suggested_reasoning": (
+                    "Ask clarifying questions. Avoid assuming intent. "
+                    "Separate known facts from inference."
+                )
+            }
+
+        lessons = []
+        recall_cues = []
+        total_confidence = 0.0
+
+        for event in related_events:
+            total_confidence += float(event.get("confidence") or 0)
+
+            if event.get("lesson"):
+                lessons.append(event["lesson"])
+
+            if event.get("amm_enabled"):
+                recall_cues.append({
+                    "audio_cue": event.get("audio_cue") or "",
+                    "rhythm_pattern": event.get("rhythm_pattern") or "",
+                    "emotional_tone": event.get("emotional_tone") or "",
+                    "recall_phrase": event.get("recall_phrase") or "",
+                    "stress_context": event.get("stress_context") or "",
+                    "safety_notes": event.get("safety_notes") or ""
+                })
+
+        avg_confidence = total_confidence / max(len(related_events), 1)
+
+        return {
+            "prediction": "Relevant prior memory suggests this may follow a known pattern.",
+            "confidence": round(avg_confidence, 2),
+            "relevant_lessons": lessons,
+            "amm_recall_cues": recall_cues,
+            "related_events": related_events,
+            "suggested_reasoning": (
+                "Use prior lessons as context, not certainty. "
+                "If AMM cues are present, use them as recall anchors, not commands."
+            )
+        }
+
+    def build_llm_context(self, user_message: str) -> str:
+        """
+        Builds an LLM-ready memory context block.
+        This can be prepended to a model prompt.
+        """
+
+        packet = self.predict_from_context(user_message)
+
+        lines = [
+            "GHOSTCORE PREDICTIVE MEMORY CONTEXT",
+            "Use this as background memory, not absolute truth.",
+            f"Prediction: {packet['prediction']}",
+            f"Confidence: {packet['confidence']}",
+            "",
+            "Relevant lessons:"
+        ]
+
+        for lesson in packet.get("relevant_lessons", []):
+            lines.append(f"- {lesson}")
+
+        if packet.get("amm_recall_cues"):
+            lines.append("")
+            lines.append("EchoWiring / AMM recall cues:")
+            for cue in packet["amm_recall_cues"]:
+                lines.append(f"- Audio cue: {cue['audio_cue']}")
+                lines.append(f"  Rhythm: {cue['rhythm_pattern']}")
+                lines.append(f"  Emotional tone: {cue['emotional_tone']}")
+                lines.append(f"  Recall phrase: {cue['recall_phrase']}")
+                lines.append(f"  Stress context: {cue['stress_context']}")
+                lines.append(f"  Safety notes: {cue['safety_notes']}")
+
+        lines.append("")
+        lines.append(f"Current user message: {user_message}")
+
+        return "\n".join(lines)
+
+    def export_json(self, output_path: str = "ghostcore_echowiring_export.json"):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            cur.execute("SELECT * FROM learning_events ORDER BY when_utc DESC")
+            events = [dict(row) for row in cur.fetchall()]
+
+            cur.execute("SELECT * FROM patterns ORDER BY updated_utc DESC")
+            patterns = [dict(row) for row in cur.fetchall()]
+
+        payload = {
+            "exported_utc": datetime.now(timezone.utc).isoformat(),
+            "events": events,
+            "patterns": patterns
+        }
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+        return output_path
+
+
+if __name__ == "__main__":
+    memory = EchoWiringMemory()
+
+    # Example 1: forensic learning event with AMM disabled
+    memory.add_event(
+        who="user",
+        what="Observed login failure through default DFS authentication followed by AD success.",
+        why="User wanted to determine whether fallback authentication was normal, suspicious, or tied to a hidden transaction.",
+        context="Authentication logs, DFS failure, Active Directory success, payout correlation.",
+        outcome="The pattern is not automatically malicious, but becomes suspicious when paired with missing payout records or privilege-sensitive events.",
+        lesson=(
+            "Authentication fallback is not proof of compromise alone. "
+            "Correlate with timing, role, transaction events, device errors, and missing logs."
+        ),
+        confidence=0.84,
+        tags=["forensics", "authentication", "active_directory", "logs"]
+    )
+
+    # Example 2: EchoWiring-enabled learning event
+    memory.add_event(
+        who="operator",
+        what="Learned emergency oxygen loop calibration sequence.",
+        why="Procedure must be recalled under panic, alarm noise, and cognitive overload.",
+        context="Spacecraft emergency procedure training.",
+        outcome="Recall improved when paired with a slow four-beat breathing rhythm.",
+        lesson=(
+            "For emergency procedures, pair each step with a stable rhythm and a short recall phrase."
+        ),
+        confidence=0.78,
+        tags=["AMM", "EchoWiring", "training", "emergency_recall"],
+
+        amm_enabled=True,
+        consent_confirmed=True,
+        audio_cue="low cello drone in E minor",
+        rhythm_pattern="4-count inhale, 4-count hold, 4-count action",
+        emotional_tone="calm urgency",
+        recall_phrase="The reactor remembers the melody.",
+        stress_context="alarm state, low oxygen, operator panic",
+        safety_notes=(
+            "Use only with consent. Do not use for covert conditioning. "
+            "Avoid trauma-linked tones unless supervised."
+        )
+    )
+
+    # Example query
+    user_message = "How should the AI remember emergency procedures under stress?"
+    print(memory.build_llm_context(user_message))
+
+    # Optional export
+    exported = memory.export_json()
+    print(f"\nExported memory archive to: {exported}")
 MAX_KNOWLEDGE_FILE_BYTES = 1_000_000
 
 logger = logging.getLogger("PortableLLM")
@@ -566,6 +950,57 @@ MAX_SITE_PAGES_PER_SOURCE = 10
 MAX_CHAT_LEARNING_CHARS = 6000
 MAX_KNOWLEDGE_CONTEXT_CHARS = 12_000
 MAX_KNOWLEDGE_SNIPPETS_PER_QUERY = 8
+MAX_MEMORY_SUMMARY_BULLETS = 10
+MEMORY_RETRIEVAL_STOPWORDS = {
+    "about",
+    "after",
+    "again",
+    "also",
+    "because",
+    "being",
+    "could",
+    "does",
+    "from",
+    "have",
+    "into",
+    "just",
+    "learn",
+    "like",
+    "need",
+    "other",
+    "please",
+    "response",
+    "responses",
+    "should",
+    "that",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "using",
+    "want",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
+    "would",
+}
+SENSITIVE_MEMORY_MARKERS = {
+    "api key",
+    "apikey",
+    "auth token",
+    "bearer token",
+    "credit card",
+    "private key",
+    "password",
+    "secret key",
+    "seed phrase",
+    "ssn",
+    "token",
+}
 
 
 class PortableLLM:
@@ -603,6 +1038,9 @@ class PortableLLM:
         )
         self.web_learner = self._create_web_learner()
         self.improvement_store = SelfImprovementStore()
+        self.predictive_memory = self._create_predictive_memory()
+        self.echowiring_memory = self._create_echowiring_memory()
+        self.cognitive_engine = self._create_cognitive_engine()
 
         self.stats = LLMStats()
         self._quality_threshold = 72
@@ -712,6 +1150,68 @@ class PortableLLM:
 
         return raw.strip()
 
+    @staticmethod
+    def _load_text_module(module_name: str, file_name: str):
+        """Load one Python source module from the local Modules folder even though it is stored as .txt."""
+        path = Path(__file__).resolve().parent / MODULES_FOLDER / file_name
+        if not path.exists():
+            return None
+
+        try:
+            loader = importlib.machinery.SourceFileLoader(module_name, str(path))
+            spec = importlib.util.spec_from_loader(module_name, loader)
+            if not spec:
+                return None
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+            return module
+        except Exception as exc:
+            logger.warning("Unable to load module %s from %s: %s", module_name, path, exc)
+            return None
+
+    def _module_db_path(self, db_name: str) -> str:
+        return str(Path(__file__).resolve().parent / db_name)
+
+    def _create_predictive_memory(self):
+        """Attach the Predictive learning module when present."""
+        module = self._load_text_module("perseus_predictive_learning", PREDICTIVE_LEARNING_MODULE_FILE)
+        cls = getattr(module, "PredictiveLearningMemory", None) if module else None
+        if not cls:
+            return None
+        try:
+            return cls(db_path=self._module_db_path(PREDICTIVE_LEARNING_DB_PATH))
+        except Exception as exc:
+            logger.warning("Predictive learning module unavailable: %s", exc)
+            return None
+
+    def _create_echowiring_memory(self):
+        """Attach the asynchronous/EchoWiring memory module when present."""
+        module = self._load_text_module("perseus_asynchronous_learning", ASYNCHRONOUS_LEARNING_MODULE_FILE)
+        cls = getattr(module, "EchoWiringMemory", None) if module else None
+        if not cls:
+            return None
+        try:
+            return cls(db_path=self._module_db_path(ECHOWIRING_MEMORY_DB_PATH))
+        except Exception as exc:
+            logger.warning("EchoWiring memory module unavailable: %s", exc)
+            return None
+
+    def _create_cognitive_engine(self):
+        """Attach the Cognitive Functions module when present."""
+        module = self._load_text_module("perseus_cognitive_functions", COGNITIVE_FUNCTIONS_MODULE_FILE)
+        cls = getattr(module, "GhostCoreCognitiveEngine", None) if module else None
+        db_cls = getattr(module, "CognitiveMemoryDB", None) if module else None
+        if not cls:
+            return None
+        try:
+            engine = cls()
+            if db_cls:
+                engine.db = db_cls(db_path=self._module_db_path(COGNITIVE_STATE_DB_PATH))
+            return engine
+        except Exception as exc:
+            logger.warning("Cognitive functions module unavailable: %s", exc)
+            return None
+
     def available_providers(self) -> List[str]:
         """Return available providers from existing conversation core."""
         return self.manager.get_available_providers()
@@ -741,6 +1241,7 @@ class PortableLLM:
 
         profile = self._profile_prompt(prompt)
         enriched = self._enrich_prompt_with_knowledge(prompt)
+        enriched = self._enrich_prompt_with_predictive_modules(enriched, prompt)
         self.conversation.add_message(
             "user",
             prompt,
@@ -828,20 +1329,22 @@ class PortableLLM:
     @staticmethod
     def _build_grounded_response(prompt: str, context: str) -> str:
         """Deterministic rescue response when grounded output quality is too low."""
+        context_bullets = _context_preview_bullets(context)
+        bullet_text = "\n".join(f"- {item}" for item in context_bullets)
         return (
             "Summary:\n"
-            "Based on currently ingested reporting, there is relevant context tied to your request. "
-            "The key takeaway is to treat this as actionable but still validate details against primary sources before operational changes.\n\n"
+            "I found relevant learned context for this request. The safe answer is to use that context as the base, "
+            "separate confirmed details from assumptions, and turn the result into concrete next actions instead of guessing.\n\n"
             "Ingested Context Used:\n"
-            f"- {context or 'Relevant ingested context was retrieved from configured news/security sources.'}\n\n"
-            "Educational Notes:\n"
-            "- Why this matters: timely ingestion helps detect trends and incidents earlier.\n"
-            "- Practical implication: prioritize verification, patch cadence, and communications based on severity.\n"
-            "- Uncertainty: news summaries can omit technical depth; confirm with vendor advisories/CVE records.\n\n"
+            f"{bullet_text or '- Relevant learned context was retrieved, but the preview was too small to summarize deterministically.'}\n\n"
+            "Reasoned Takeaway:\n"
+            "- What matters: answer from the retrieved facts first, then add interpretation only where the evidence supports it.\n"
+            "- Why it matters: this keeps Perseus useful without pretending a weak model response was stronger than it was.\n"
+            "- Uncertainty: if the retrieved context is incomplete, validate against primary docs, local files, or source material before relying on it.\n\n"
             "Next Steps:\n"
-            "1. Cross-check the claim with primary technical references.\n"
-            "2. Map impact to your environment.\n"
-            "3. Execute mitigations and monitor for updates.\n\n"
+            "1. Ask a narrower follow-up naming the file, source, feature, or decision you want analyzed.\n"
+            "2. Add or ingest the missing source material if the context above is thin.\n"
+            "3. Use the model-backed path with Ollama running for a fuller synthesized answer.\n\n"
             f"Original question: {prompt}"
         )
 
@@ -914,6 +1417,19 @@ class PortableLLM:
         if any(marker in response_text.lower() for marker in low_value_responses):
             response_text = ""
 
+        memory_summary = self._extract_memory_summary(
+            prompt=prompt_text,
+            response=response_text,
+            profile=profile,
+            quality=quality,
+        )
+        if not memory_summary and quality.score < self._quality_threshold and len(prompt_text.split()) <= 4:
+            return
+
+        memory_block = "\n".join(f"- {item}" for item in memory_summary)
+        memory_categories = self._memory_categories(memory_summary)
+        retrieval_terms = " ".join(self._memory_retrieval_keywords(prompt_text, memory_summary, profile))
+
         content = (
             "Learned chat interaction:\n"
             f"Timestamp: {datetime.utcnow().isoformat(timespec='seconds')}Z\n"
@@ -921,6 +1437,12 @@ class PortableLLM:
             f"Complexity: {profile.complexity}\n"
             f"Provider: {provider}\n"
             f"Quality score: {quality.score}\n\n"
+            "Memory categories:\n"
+            f"{', '.join(memory_categories) or 'topic'}\n\n"
+            "Memory summary:\n"
+            f"{memory_block or '- User asked about this topic; preserve the topic and answer style for future context.'}\n\n"
+            "Retrieval keywords:\n"
+            f"{retrieval_terms}\n\n"
             "User input:\n"
             f"{prompt_text}\n"
         )
@@ -936,6 +1458,150 @@ class PortableLLM:
             self.ingest_web_content(url=url, content=content, title=title)
         except Exception as exc:
             logger.warning("Chat learning failed: %s", exc)
+
+    @staticmethod
+    def _memory_categories(memories: List[str]) -> List[str]:
+        categories: List[str] = []
+        mapping = [
+            ("preference", ["preference", "values", "expects", "prefers"]),
+            ("project", ["project", "repo", "assistant", "tool", "working on"]),
+            ("identity", ["identity", "name", "self-context", "call"]),
+            ("correction", ["correction", "not ", "instead", "avoid"]),
+            ("style", ["style", "tone", "sophisticated", "intelligent", "candid"]),
+            ("task", ["topic", "task", "roadmap", "plan", "analysis"]),
+        ]
+        blob = "\n".join(memories).lower()
+        for category, markers in mapping:
+            if any(marker in blob for marker in markers):
+                categories.append(category)
+        return categories or (["topic"] if memories else [])
+
+    @staticmethod
+    def _memory_retrieval_keywords(prompt: str, memories: List[str], profile: PromptProfile) -> List[str]:
+        """Build dense, low-noise terms that make chat memories easy to retrieve later."""
+        seed_text = f"{prompt} {profile.intent} {' '.join(memories)}"
+        terms = [
+            term.lower()
+            for term in re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{3,}", seed_text)
+            if term.lower() not in MEMORY_RETRIEVAL_STOPWORDS
+        ]
+        phrases = re.findall(
+            r"(?:called|named|project is|repo is|prefer|want|need)\s+([^.!?;]{2,80})",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+        phrase_terms = [re.sub(r"\s+", " ", phrase).strip(" ,:-").lower() for phrase in phrases]
+
+        ordered: List[str] = ["chat-memory", "memory-summary", f"intent-{profile.intent}"]
+        if any("preference" in item.lower() or "values" in item.lower() for item in memories):
+            ordered.extend(["user-preference", "response-style"])
+        if any("project" in item.lower() for item in memories):
+            ordered.extend(["project-context", "user-project"])
+        if any("correction" in item.lower() or "avoid" in item.lower() for item in memories):
+            ordered.extend(["correction", "avoid-repeat"])
+
+        for item in phrase_terms + terms:
+            if item and item not in ordered:
+                ordered.append(item)
+            if len(ordered) >= 45:
+                break
+        return ordered
+
+    @staticmethod
+    def _extract_memory_summary(
+        prompt: str,
+        response: str,
+        profile: PromptProfile,
+        quality: ResponseQuality,
+    ) -> List[str]:
+        """Extract compact durable memories from a chat turn without needing another model."""
+        text = re.sub(r"\s+", " ", (prompt or "").strip())
+        lower = text.lower()
+        memories: List[str] = []
+
+        def add_memory(item: str) -> None:
+            item = re.sub(r"\s+", " ", item).strip(" .")
+            if not item:
+                return
+            if _looks_sensitive_memory(item):
+                return
+            if _looks_low_value_memory(item):
+                return
+            if item.lower() in {m.lower() for m in memories}:
+                return
+            memories.append(item[:260])
+
+        explicit_patterns = [
+            (r"\bremember (?:that )?(.+?)(?:[.!?]|$)", "User explicitly asked Perseus to remember: {}"),
+            (r"\b(?:call me|my name is)\s+(.+?)(?:[.!?]|$)", "User identity/name preference: {}"),
+            (r"\b(?:i prefer|i like|i want|i need)\s+(.+?)(?:[.!?]|$)", "User preference: {}"),
+            (r"\b(?:always|please always)\s+(.+?)(?:[.!?]|$)", "User standing instruction: always {}"),
+            (r"\b(?:never|do not|don't)\s+(.+?)(?:[.!?]|$)", "User standing instruction: avoid {}"),
+            (r"\b(?:correct(?:ion)?|actually)[:,]?\s+(.+?)(?:[.!?]|$)", "User correction: {}"),
+            (r"\bmy (?:project|app|repo|repository|tool|assistant) (?:is|called|named)\s+(.+?)(?:[.!?]|$)", "User project context: {}"),
+            (r"\b(?:we are|we're|i am|i'm|im) (?:building|making|working on|creating)\s+(.+?)(?:[.!?]|$)", "User current project/work: {}"),
+            (r"\b(?:i am|i'm|im)\s+(.+?)(?:[.!?]|$)", "User self-context: {}"),
+        ]
+        for pattern, template in explicit_patterns:
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                value = match.group(1).strip(" ,;:-")
+                if 2 <= len(value) <= 180:
+                    add_memory(template.format(value))
+
+        if any(marker in lower for marker in ["sophisticated", "intelligent", "smart", "educated response"]):
+            add_memory("User values sophisticated, intelligent, educated responses over generic assistant filler")
+        if any(marker in lower for marker in ["learn as", "learn from", "remember", "memory"]):
+            add_memory("User expects Perseus to learn from useful chat turns and reuse that memory later")
+        if any(marker in lower for marker in ["local", "no other ai", "without other ai", "wouldnt need to use any other ais", "wouldn't need to use any other ais"]):
+            add_memory("User prefers Perseus to rely on local learning and local models instead of other AI services")
+
+        topic_terms = [
+            term
+            for term in re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{3,}", lower)
+            if term not in {
+                "that",
+                "this",
+                "with",
+                "from",
+                "have",
+                "want",
+                "need",
+                "using",
+                "would",
+                "could",
+                "should",
+                "response",
+                "responses",
+            }
+        ]
+        if topic_terms:
+            add_memory(f"Recent user topic keywords: {', '.join(dict.fromkeys(topic_terms[:10]))}")
+
+        if response and quality.score >= 80:
+            response_terms = [
+                term
+                for term in re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{4,}", response.lower())
+                if term not in {"because", "therefore", "which", "their", "there", "about", "would", "should"}
+            ]
+            if response_terms:
+                add_memory(f"High-quality answer touched: {', '.join(dict.fromkeys(response_terms[:8]))}")
+
+        if profile.intent in {"feedback", "strategic", "analytical"}:
+            add_memory(f"For {profile.intent} prompts, user benefits from candid judgment, trade-offs, and concrete next steps")
+
+        correction_match = re.search(r"\bnot\s+(.{2,80}?)\s+but\s+(.{2,100}?)(?:[.!?]|$)", text, flags=re.IGNORECASE)
+        if correction_match:
+            add_memory(
+                "User correction: not "
+                f"{correction_match.group(1).strip(' ,;:-')} but {correction_match.group(2).strip(' ,;:-')}"
+            )
+
+        if any(marker in lower for marker in ["too generic", "generic", "not specific", "more specific", "vague"]):
+            add_memory("User dislikes generic or vague answers; increase specificity, concrete examples, and direct judgment")
+        if any(marker in lower for marker in ["heuristic", "heuristics", "rules", "signals"]):
+            add_memory("User values explicit heuristics and decision rules that improve future answer quality")
+
+        return memories[:MAX_MEMORY_SUMMARY_BULLETS]
 
     def ingest_url(self, url: str, timeout: int = 15) -> Dict[str, object]:
         """Fetch a URL and ingest extracted text into the learning store."""
@@ -1225,7 +1891,11 @@ class PortableLLM:
 
     def _enrich_prompt_with_knowledge(self, prompt: str) -> EnrichedPrompt:
         """Inject relevant learned web context into the prompt when available."""
-        if _is_small_talk_prompt(prompt) or _is_capability_prompt(prompt) or _is_general_knowledge_prompt(prompt):
+        if (
+            _is_small_talk_prompt(prompt)
+            or _is_capability_prompt(prompt)
+            or (_is_general_knowledge_prompt(prompt) and not _is_memory_prompt(prompt))
+        ):
             return EnrichedPrompt(text=prompt, has_context=False)
 
         if not self.web_learner:
@@ -1240,7 +1910,7 @@ class PortableLLM:
         if not context:
             return EnrichedPrompt(text=prompt, has_context=False)
 
-        preview = context[:260].replace("\n", " ").strip()
+        preview = context[:1200].replace("\n", " ").strip()
         enriched_text = (
             "You have retrieved ingested web knowledge relevant to this query. "
             "Ground your answer in that ingested context, including learned user chat memory when relevant, "
@@ -1260,6 +1930,53 @@ class PortableLLM:
         )
 
         return EnrichedPrompt(text=enriched_text, has_context=True, context_preview=preview)
+
+    def _enrich_prompt_with_predictive_modules(self, enriched: EnrichedPrompt, prompt: str) -> EnrichedPrompt:
+        """Inject context from the three Modules/ learning engines when available."""
+        module_context = self._build_predictive_module_context(prompt)
+        if not module_context:
+            return enriched
+
+        enriched_text = (
+            "You have additional predictive/cognitive learning context from local Perseus modules. "
+            "Use it as probabilistic background, not as certainty. Prefer explicit user corrections, standing instructions, "
+            "prior lessons, and cognitive risk notes when relevant.\n\n"
+            f"{module_context}\n\n"
+            "Current prompt payload:\n"
+            f"{enriched.text}"
+        )
+        preview_parts = [part for part in [enriched.context_preview, module_context[:800].replace("\n", " ").strip()] if part]
+        return EnrichedPrompt(text=enriched_text, has_context=True, context_preview=" | ".join(preview_parts))
+
+    def _build_predictive_module_context(self, prompt: str) -> str:
+        """Read predictions/lessons from Predictive, EchoWiring, and Cognitive modules."""
+        blocks: List[str] = []
+
+        if self.predictive_memory:
+            try:
+                packet = self.predictive_memory.predict_from_context(prompt, limit=5)
+                blocks.append(_format_prediction_packet("PREDICTIVE LEARNING", packet))
+            except Exception as exc:
+                logger.warning("Predictive learning context failed: %s", exc)
+
+        if self.echowiring_memory:
+            try:
+                packet = self.echowiring_memory.predict_from_context(prompt, limit=5)
+                blocks.append(_format_prediction_packet("ASYNCHRONOUS / ECHOWIRING LEARNING", packet))
+            except Exception as exc:
+                logger.warning("EchoWiring context failed: %s", exc)
+
+        if self.cognitive_engine:
+            try:
+                traces = self.cognitive_engine.retrieve_relevant_memory(prompt)
+                cognitive_block = _format_cognitive_traces(traces)
+                if cognitive_block:
+                    blocks.append(cognitive_block)
+            except Exception as exc:
+                logger.warning("Cognitive context failed: %s", exc)
+
+        filtered = [block for block in blocks if block and "No strong" not in block]
+        return "\n\n".join(filtered).strip()[:5000]
 
     def _lookup_knowledge_context(self, prompt: str) -> str:
         """Try multiple targeted queries and retain as much relevant learned content as the context budget allows."""
@@ -1391,21 +2108,46 @@ class PortableLLM:
         lower = prompt.lower()
         queries: List[str] = []
 
+        if _is_memory_prompt(prompt):
+            queries.extend(
+                [
+                    "chat-memory memory-summary",
+                    "Memory summary User preference",
+                    "User project context User standing instruction",
+                    "User values sophisticated intelligent responses",
+                    "User expects Perseus to learn from useful chat turns",
+                ]
+            )
+
         cve_matches = re.findall(r"cve-\d{4}-\d{4,}", lower, flags=re.IGNORECASE)
         cwe_matches = re.findall(r"cwe-\d+", lower, flags=re.IGNORECASE)
         for m in cve_matches + cwe_matches:
             queries.append(m.upper())
 
+        quoted_phrases = re.findall(r"['\"]([^'\"]{3,80})['\"]", prompt)
+        queries.extend(phrase.strip() for phrase in quoted_phrases if phrase.strip())
+
         tokens = re.findall(r"[a-zA-Z]{4,}", lower)
-        stop = {"what", "about", "that", "with", "from", "this", "have", "does", "into", "their", "they", "them", "explain", "summarize"}
+        stop = MEMORY_RETRIEVAL_STOPWORDS | {"explain", "summarize"}
         keywords = [t for t in tokens if t not in stop]
-        queries.extend(keywords[:4])
+        queries.extend(keywords[:6])
 
         if len(keywords) >= 2:
             queries.append(f"{keywords[0]} {keywords[1]}")
+        if len(keywords) >= 3:
+            queries.append(" ".join(keywords[:3]))
 
         queries.append(prompt)
-        return queries
+        deduped: List[str] = []
+        seen = set()
+        for query in queries:
+            normalized = re.sub(r"\s+", " ", str(query or "")).strip()
+            key = normalized.lower()
+            if not normalized or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(normalized)
+        return deduped
 
     def _profile_prompt(self, prompt: str) -> PromptProfile:
         """Classify user prompt to tailor prompting strategy."""
@@ -1582,6 +2324,10 @@ class PortableLLM:
             "Respond like a capable general-purpose assistant: natural, thoughtful, clear, and directly useful.",
             "For every question, first reason internally about the relevant who, what, when, where, why, and how; answer only the dimensions that matter.",
             "Prefer synthesis over trivia: explain the core mechanism, context, consequences, trade-offs, and practical implications.",
+            "Use learned user preferences, project facts, and prior chat memory when relevant; do not mention memory unless it improves the answer.",
+            "Treat explicit user corrections, standing instructions, and project context as higher-priority memory than casual topic history.",
+            "Prefer local learned context and local model reasoning over remote/cloud AI; only use remote providers when the caller explicitly disabled strict local-only mode.",
+            "Make every answer earn its keep: include evidence, examples, caveats, and a decision or action when the task calls for it.",
             "Match the user's tone and requested depth.",
             "Give genuine feedback: identify what is strong, what is weak, why it matters, and what to do next.",
             "Do not flatter, over-agree, or pad the answer; be candid without being harsh.",
@@ -1623,7 +2369,8 @@ class PortableLLM:
         if refine and prior_response:
             system += (
                 "\nImprove the previous draft by increasing specificity, correctness, practical detail, and genuine judgment. "
-                "Remove generic phrasing, hollow encouragement, and unsupported claims; tighten structure."
+                "Remove generic phrasing, hollow encouragement, unsupported claims, and vague advice; tighten structure "
+                "and explicitly address missing reasoning, examples, caveats, or next steps."
             )
 
         history = self.conversation.messages[-self._max_history_messages :]
@@ -1660,6 +2407,9 @@ class PortableLLM:
 
         generic_markers = [
             "i don't have specific knowledge",
+            "i don't remember",
+            "i do not remember",
+            "i have no memory",
             "as an ai language model",
             "cannot provide",
             "i'm unable to",
@@ -1689,6 +2439,22 @@ class PortableLLM:
         if any(marker and marker in lower for marker in filler_markers):
             score -= 10
             reasons.append("Contains filler or hollow agreement instead of direct value")
+
+        insight_signals = [
+            "because",
+            "for example",
+            "in practice",
+            "trade-off",
+            "assumption",
+            "evidence",
+            "risk",
+            "therefore",
+            "mechanism",
+            "next",
+        ]
+        if not profile.prefer_concise and sum(1 for marker in insight_signals if marker in lower) < 2:
+            score -= 6
+            reasons.append("Limited sophistication signals")
 
         if profile.prefer_structure or profile.intent in {"strategic", "analytical"}:
             has_structure = any(token in text for token in ["\n-", "\n1.", ":\n", "##"])
@@ -1741,6 +2507,10 @@ class PortableLLM:
                 "from ingested",
                 "from the ingested",
                 "according to ingested",
+                "learned memory",
+                "memory summary",
+                "user preference",
+                "project context",
             ]
             if not any(marker in lower for marker in grounded_markers):
                 score -= 15
@@ -1750,6 +2520,10 @@ class PortableLLM:
             if sum(1 for marker in educational_markers if marker in lower) < 2:
                 score -= 10
                 reasons.append("Insufficient educational framing for grounded response")
+
+            if any(marker in lower for marker in ["memory", "preference", "project context", "learned"]):
+                score += 3
+                reasons.append("Uses learned context or memory explicitly")
 
         if score >= 85:
             reasons.append("Strong depth and structure")
@@ -2327,11 +3101,34 @@ def _is_capability_prompt(prompt: str) -> bool:
     return any(marker in lower for marker in capability_markers)
 
 
+def _is_memory_prompt(prompt: str) -> bool:
+    """Return True when the user is asking Perseus to use or update learned chat memory."""
+    text = _extract_user_request(prompt)
+    lower = re.sub(r"\s+", " ", text.lower()).strip(" .!?\t\r\n")
+    memory_markers = [
+        "remember",
+        "what do you know about me",
+        "what do you remember about me",
+        "what have you learned",
+        "what did you learn",
+        "my preferences",
+        "my project context",
+        "user memory",
+        "chat memory",
+        "learn as you go",
+        "learned about me",
+    ]
+    return any(marker in lower for marker in memory_markers)
+
+
 def _is_general_knowledge_prompt(prompt: str) -> bool:
     """Return True for short general-purpose questions that should not require ingested context."""
     text = _extract_user_request(prompt)
     lower = re.sub(r"\s+", " ", text.lower()).strip(" .!?\t\r\n")
     if not lower:
+        return False
+
+    if _is_memory_prompt(prompt):
         return False
 
     if _general_knowledge_fallback(lower):
@@ -2364,6 +3161,9 @@ def _is_general_knowledge_prompt(prompt: str) -> bool:
         "this project",
         "ingested",
         "learned",
+        "remember",
+        "memory",
+        "preferences",
         "knowledge base",
         "file",
         "folder",
@@ -2372,6 +3172,75 @@ def _is_general_knowledge_prompt(prompt: str) -> bool:
     return lower.startswith(question_starters) and len(lower.split()) <= 24 and not any(
         marker in lower for marker in domain_markers
     )
+
+
+def _context_preview_bullets(context: str, max_bullets: int = 6) -> List[str]:
+    """Turn retrieved context preview text into concise fallback bullets."""
+    text = re.sub(r"\s+", " ", (context or "").strip())
+    if not text:
+        return []
+
+    parts = re.split(r"(?:(?:Source:|Memory summary:|Retrieval keywords:)\s*)", text)
+    candidates: List[str] = []
+    for part in parts:
+        cleaned = re.sub(r"\s+", " ", part).strip(" -:;.,")
+        if not cleaned:
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+", cleaned):
+            sentence = sentence.strip(" -:;.,")
+            if len(sentence) < 18:
+                continue
+            candidates.append(sentence[:220])
+            break
+
+    if not candidates:
+        candidates = [text[:220]]
+
+    bullets: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        bullets.append(candidate)
+        if len(bullets) >= max_bullets:
+            break
+    return bullets
+
+
+def _looks_sensitive_memory(text: str) -> bool:
+    """Avoid persisting obvious secrets as durable memory."""
+    lower = (text or "").lower()
+    if any(marker in lower for marker in SENSITIVE_MEMORY_MARKERS):
+        return True
+    secret_like_patterns = [
+        r"sk-[a-zA-Z0-9]{16,}",
+        r"[a-zA-Z0-9_=-]{32,}",
+        r"-----BEGIN [A-Z ]+PRIVATE KEY-----",
+        r"\b\d{3}-\d{2}-\d{4}\b",
+        r"\b(?:\d[ -]*?){13,16}\b",
+    ]
+    return any(re.search(pattern, text or "") for pattern in secret_like_patterns)
+
+
+def _looks_low_value_memory(text: str) -> bool:
+    """Filter memories that are too vague to help future retrieval or behavior."""
+    normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if len(normalized) < 12:
+        return True
+    low_value = {
+        "user preference: help",
+        "user preference: this",
+        "user preference: that",
+        "user self-context: here",
+        "user self-context: ready",
+        "user explicitly asked perseus to remember: this",
+    }
+    if normalized in low_value:
+        return True
+    content_terms = [term for term in re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{3,}", normalized) if term not in MEMORY_RETRIEVAL_STOPWORDS]
+    return len(content_terms) < 2
 
 
 def _general_knowledge_fallback(prompt: str) -> str:
