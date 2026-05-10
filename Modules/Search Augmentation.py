@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-Search Augmentation Module for PortableLLM / Perseus
+Search Augmentation Module for PortableLLM / Perseus.
 
 Purpose:
-- Detect when local knowledge is insufficient.
-- Search the web using configurable providers.
-- Cache search results locally.
-- Return compact source-grounded context to the LLM.
-- Avoid hijacking simple prompts when local answer is enough.
+- Decide when online search is useful.
+- Query search providers or fallback sources.
+- Cache results locally.
+- Return compact source context to PortableLLM.
 
-Supported providers:
-- Brave Search API, if BRAVE_SEARCH_API_KEY is set.
-- Serper Google Search API, if SERPER_API_KEY is set.
-- Wikipedia summary fallback.
-- DuckDuckGo HTML fallback.
+Network providers:
+- Brave Search API if BRAVE_SEARCH_API_KEY is set.
+- Serper API if SERPER_API_KEY is set.
+- Wikipedia summary fallback for broad stable topics.
+- DuckDuckGo HTML fallback as last resort.
 
-This module does not generate final answers.
-It returns evidence/context for the main LLM to use.
+Set PortableLLM(strict_local_only=False) to allow this module to use network access.
 """
 
 from __future__ import annotations
@@ -30,9 +28,8 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from html import unescape
 from typing import Dict, List, Optional
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from urllib.parse import quote_plus, urlparse
 from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
 
 
 DEFAULT_DB_PATH = "llm_search_cache.db"
@@ -74,10 +71,6 @@ class SearchAugmentation:
 
         self._init_db()
 
-    # -------------------------
-    # DB / cache
-    # -------------------------
-
     def _init_db(self) -> None:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
@@ -90,12 +83,11 @@ class SearchAugmentation:
             """)
             conn.commit()
 
-    def _now_utc(self) -> str:
+    @staticmethod
+    def _now_utc() -> str:
         return datetime.now(timezone.utc).isoformat()
 
     def _get_cached(self, query: str) -> Optional[List[SearchResult]]:
-        now = int(time.time())
-
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
@@ -106,19 +98,15 @@ class SearchAugmentation:
         if not row:
             return None
 
-        age = now - int(row["created_epoch"] or 0)
-        if age > self.cache_ttl_seconds:
+        if int(time.time()) - int(row["created_epoch"] or 0) > self.cache_ttl_seconds:
             return None
 
         try:
-            payload = json.loads(row["results_json"] or "[]")
-            return [SearchResult(**item) for item in payload]
+            return [SearchResult(**item) for item in json.loads(row["results_json"] or "[]")]
         except Exception:
             return None
 
     def _set_cached(self, query: str, results: List[SearchResult]) -> None:
-        payload = json.dumps([asdict(r) for r in results], ensure_ascii=False)
-
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
@@ -126,13 +114,14 @@ class SearchAugmentation:
                 (query, created_utc, created_epoch, results_json)
                 VALUES (?, ?, ?, ?)
                 """,
-                (query, self._now_utc(), int(time.time()), payload),
+                (
+                    query,
+                    self._now_utc(),
+                    int(time.time()),
+                    json.dumps([asdict(result) for result in results], ensure_ascii=False),
+                ),
             )
             conn.commit()
-
-    # -------------------------
-    # Search decision
-    # -------------------------
 
     def should_search(
         self,
@@ -141,29 +130,23 @@ class SearchAugmentation:
         draft_response: str = "",
         quality_score: Optional[int] = None,
     ) -> SearchDecision:
-        """
-        Decide if online search is needed.
-
-        Search when:
-        - user explicitly asks to search/look up/current/latest
-        - the question depends on current facts
-        - local context is absent or weak
-        - draft response admits insufficient knowledge
-        - quality score is low
-
-        Do not search for:
-        - small talk
-        - pure creative writing
-        - local file questions
-        - simple stable facts unless local/model answer is missing
-        """
-
         prompt_clean = (prompt or "").strip()
         prompt_lower = prompt_clean.lower()
-        context_lower = (local_context or "").lower()
         draft_lower = (draft_response or "").lower()
 
-        explicit_search_terms = [
+        no_search_patterns = [
+            r"^hi\b",
+            r"^hello\b",
+            r"^hey\b",
+            r"write me a poem",
+            r"rewrite this",
+            r"translate this",
+            r"summarize this text",
+        ]
+        if any(re.search(pattern, prompt_lower) for pattern in no_search_patterns):
+            return SearchDecision(False, "Prompt does not require online lookup.", 0.9)
+
+        explicit_terms = [
             "search the web",
             "look up",
             "google",
@@ -181,6 +164,8 @@ class SearchAugmentation:
             "update",
             "verify online",
         ]
+        if any(term in prompt_lower for term in explicit_terms):
+            return SearchDecision(True, "User explicitly requested current or online information.", 0.95)
 
         current_sensitive_terms = [
             "ceo",
@@ -200,30 +185,13 @@ class SearchAugmentation:
             "sports",
             "forecast",
         ]
-
-        no_search_patterns = [
-            r"^hi\b",
-            r"^hello\b",
-            r"^hey\b",
-            r"write me a poem",
-            r"rewrite this",
-            r"translate this",
-            r"summarize this text",
-        ]
-
-        if any(re.search(pattern, prompt_lower) for pattern in no_search_patterns):
-            return SearchDecision(False, "Prompt does not require online lookup.", 0.9)
-
-        if any(term in prompt_lower for term in explicit_search_terms):
-            return SearchDecision(True, "User explicitly asked for current or online information.", 0.95)
-
         if any(term in prompt_lower for term in current_sensitive_terms):
             return SearchDecision(True, "Question may depend on current information.", 0.8)
 
         if quality_score is not None and quality_score < 60:
             return SearchDecision(True, "Draft quality score is low.", 0.75)
 
-        weak_response_markers = [
+        weak_markers = [
             "i do not have enough",
             "not enough learned context",
             "i don't know",
@@ -231,20 +199,10 @@ class SearchAugmentation:
             "add trusted sites",
             "ingest source material",
         ]
-
-        if any(marker in draft_lower for marker in weak_response_markers):
+        if any(marker in draft_lower for marker in weak_markers):
             return SearchDecision(True, "Draft response says local knowledge is insufficient.", 0.85)
 
-        if not context_lower and len(prompt_clean.split()) >= 5:
-            # Mild signal only. Do not search every normal question.
-            if prompt_lower.startswith(("what is", "who is", "tell me about", "explain", "how does")):
-                return SearchDecision(False, "Likely stable general knowledge; local/model answer should be tried first.", 0.65)
-
         return SearchDecision(False, "Local/model answer should be sufficient.", 0.7)
-
-    # -------------------------
-    # Search providers
-    # -------------------------
 
     def search(self, query: str, force_refresh: bool = False) -> List[SearchResult]:
         query = (query or "").strip()
@@ -285,7 +243,6 @@ class SearchAugmentation:
     ) -> Optional[Dict]:
         headers = headers or {}
         headers.setdefault("User-Agent", "PerseusPortableLLM/1.0")
-
         try:
             req = Request(url, data=body, headers=headers, method=method)
             with urlopen(req, timeout=self.timeout_seconds) as resp:
@@ -297,7 +254,6 @@ class SearchAugmentation:
     def _request_text(self, url: str, headers: Optional[Dict[str, str]] = None) -> str:
         headers = headers or {}
         headers.setdefault("User-Agent", "PerseusPortableLLM/1.0")
-
         try:
             req = Request(url, headers=headers)
             with urlopen(req, timeout=self.timeout_seconds) as resp:
@@ -314,14 +270,8 @@ class SearchAugmentation:
                 "X-Subscription-Token": self.brave_key,
             },
         )
-
-        if not data:
-            return []
-
-        web = data.get("web") or {}
-        items = web.get("results") or []
+        items = ((data or {}).get("web") or {}).get("results") or []
         now = self._now_utc()
-
         return [
             SearchResult(
                 title=unescape(item.get("title") or ""),
@@ -345,13 +295,8 @@ class SearchAugmentation:
                 "Content-Type": "application/json",
             },
         )
-
-        if not data:
-            return []
-
-        items = data.get("organic") or []
+        items = (data or {}).get("organic") or []
         now = self._now_utc()
-
         return [
             SearchResult(
                 title=unescape(item.get("title") or ""),
@@ -365,12 +310,6 @@ class SearchAugmentation:
         ]
 
     def _search_wikipedia(self, query: str) -> List[SearchResult]:
-        """
-        Good fallback for broad factual topics.
-        Not a replacement for search on current events.
-        """
-
-        # Use only the core topic. This prevents huge question strings from failing.
         topic = re.sub(r"^(tell me about|what is|who is|explain)\s+", "", query.strip(), flags=re.I)
         topic = topic.strip(" ?.!")
 
@@ -379,14 +318,12 @@ class SearchAugmentation:
 
         url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote_plus(topic)}"
         data = self._request_json(url, headers={"Accept": "application/json"})
-
-        if not data or data.get("type") == "https://mediawiki.org/wiki/HyperSwitch/errors/not_found":
+        if not data or "not_found" in str(data.get("type", "")):
             return []
 
         title = data.get("title") or topic
         extract = data.get("extract") or ""
         page_url = ((data.get("content_urls") or {}).get("desktop") or {}).get("page") or ""
-
         if not extract or not page_url:
             return []
 
@@ -401,19 +338,12 @@ class SearchAugmentation:
         ]
 
     def _search_duckduckgo_html(self, query: str) -> List[SearchResult]:
-        """
-        Last-resort fallback. HTML scraping can break.
-        Prefer Brave or Serper keys for reliability.
-        """
-
         html = self._request_text(f"https://duckduckgo.com/html/?q={quote_plus(query)}")
         if not html:
             return []
 
-        results: List[SearchResult] = []
         now = self._now_utc()
-
-        # Lightweight extraction for DuckDuckGo HTML result blocks.
+        results: List[SearchResult] = []
         blocks = re.findall(
             r'<a rel="nofollow" class="result__a" href="(.*?)">(.*?)</a>.*?'
             r'<a class="result__snippet".*?>(.*?)</a>',
@@ -422,30 +352,19 @@ class SearchAugmentation:
         )
 
         for url, title, snippet in blocks[: self.max_results]:
-            title = self._strip_html(title)
-            snippet = self._strip_html(snippet)
-            url = self._normalize_duckduckgo_url(unescape(url))
-
-            if url:
-                results.append(
-                    SearchResult(
-                        title=title,
-                        url=url,
-                        snippet=snippet,
-                        source="duckduckgo_html",
-                        retrieved_utc=now,
-                    )
+            results.append(
+                SearchResult(
+                    title=self._strip_html(title),
+                    url=unescape(url),
+                    snippet=self._strip_html(snippet),
+                    source="duckduckgo_html",
+                    retrieved_utc=now,
                 )
-
+            )
         return results
-
-    # -------------------------
-    # Context formatting
-    # -------------------------
 
     def build_search_context(self, query: str, results: Optional[List[SearchResult]] = None) -> str:
         results = results if results is not None else self.search(query)
-
         if not results:
             return ""
 
@@ -470,52 +389,33 @@ class SearchAugmentation:
             "Instruction: Answer using the search context only when it is relevant. "
             "Separate confirmed facts from assumptions. Mention uncertainty when snippets are thin."
         )
-
         return "\n".join(lines)
 
     def search_and_build_context(self, query: str) -> str:
-        results = self.search(query)
-        return self.build_search_context(query, results)
+        return self.build_search_context(query, self.search(query))
 
-    # -------------------------
-    # Utilities
-    # -------------------------
-
-    def _strip_html(self, text: str) -> str:
+    @staticmethod
+    def _strip_html(text: str) -> str:
         text = re.sub(r"<.*?>", " ", text or "", flags=re.DOTALL)
         text = unescape(text)
-        text = re.sub(r"\s+", " ", text).strip()
-        return text
-
-    def _normalize_duckduckgo_url(self, url: str) -> str:
-        """Return the real result URL from DuckDuckGo redirect links when present."""
-        parsed = urlparse(url or "")
-        if parsed.netloc.lower().endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
-            target = (parse_qs(parsed.query).get("uddg") or [""])[0]
-            if target:
-                return unquote(target)
-        return url
+        return re.sub(r"\s+", " ", text).strip()
 
     def _dedupe_results(self, results: List[SearchResult]) -> List[SearchResult]:
         seen = set()
-        clean = []
-
+        clean: List[SearchResult] = []
         for result in results:
             url = (result.url or "").strip()
             title = (result.title or "").strip()
-
             if not url or not title:
                 continue
-
             key = self._canonical_url(url)
             if key in seen:
                 continue
-
             seen.add(key)
             clean.append(result)
-
         return clean
 
-    def _canonical_url(self, url: str) -> str:
+    @staticmethod
+    def _canonical_url(url: str) -> str:
         parsed = urlparse(url)
         return f"{parsed.netloc.lower()}{parsed.path}".rstrip("/")

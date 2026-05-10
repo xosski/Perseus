@@ -397,11 +397,13 @@ DEFAULT_KNOWLEDGE_FOLDER = "knowledge"
 DEFAULT_PRINCESS_PROTOCOL_FOLDER = "Princess protocol"
 DEFAULT_AUTO_KNOWLEDGE_FOLDERS = (DEFAULT_KNOWLEDGE_FOLDER, DEFAULT_PRINCESS_PROTOCOL_FOLDER)
 MODULES_FOLDER = "Modules"
-PREDICTIVE_LEARNING_MODULE_FILE = "Predictive learning.py"
-ASYNCHRONOUS_LEARNING_MODULE_FILE = "Asyncronous Learning.py"
-COGNITIVE_FUNCTIONS_MODULE_FILE = "Cognitive Functions.py"
+PREDICTIVE_LEARNING_MODULE_FILE = "Predictive learning.txt"
+ASYNCHRONOUS_LEARNING_MODULE_FILE = "Asyncronous Learning.txt"
+COGNITIVE_FUNCTIONS_MODULE_FILE = "Cognitive Functions.txt"
 SEARCH_AUGMENTATION_MODULE_FILE = "Search Augmentation.py"
+INTROSPECTIVE_LEARNING_MODULE_FILE = "Introspective Learning.py"
 SEARCH_CACHE_DB_PATH = "llm_search_cache.db"
+INTROSPECTIVE_LEARNING_DB_PATH = "introspective_learning.db"
 PREDICTIVE_LEARNING_DB_PATH = "predictive_learning_memory.db"
 ECHOWIRING_MEMORY_DB_PATH = "ghostcore_echowiring_memory.db"
 COGNITIVE_STATE_DB_PATH = "ghostcore_cognitive_state.db"
@@ -420,8 +422,380 @@ SUPPORTED_KNOWLEDGE_EXTENSIONS = {
     ".typed",
     "",
 }
-# Learning modules are loaded dynamically from local .py/.txt files.
-# Keep their code in separate files so portable_llm.py does not drift out of sync.
+DB_PATH = "ghostcore_echowiring_memory.db"
+
+
+class EchoWiringMemory:
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS learning_events (
+                id TEXT PRIMARY KEY,
+                who TEXT,
+                when_utc TEXT,
+                what TEXT,
+                why TEXT,
+                context TEXT,
+                outcome TEXT,
+                lesson TEXT,
+                confidence REAL,
+                tags TEXT,
+
+                -- AMM / EchoWiring fields
+                amm_enabled INTEGER,
+                consent_confirmed INTEGER,
+                audio_cue TEXT,
+                rhythm_pattern TEXT,
+                emotional_tone TEXT,
+                recall_phrase TEXT,
+                stress_context TEXT,
+                safety_notes TEXT
+            )
+            """)
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS patterns (
+                id TEXT PRIMARY KEY,
+                pattern_name TEXT,
+                description TEXT,
+                evidence TEXT,
+                prediction TEXT,
+                confidence REAL,
+                created_utc TEXT,
+                updated_utc TEXT,
+                tags TEXT
+            )
+            """)
+
+            conn.commit()
+
+    def _make_id(self, payload: str) -> str:
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    def add_event(
+        self,
+        who: str,
+        what: str,
+        why: str,
+        context: str = "",
+        outcome: str = "",
+        lesson: str = "",
+        confidence: float = 0.5,
+        tags: Optional[List[str]] = None,
+
+        # EchoWiring / AMM fields
+        amm_enabled: bool = False,
+        consent_confirmed: bool = False,
+        audio_cue: str = "",
+        rhythm_pattern: str = "",
+        emotional_tone: str = "",
+        recall_phrase: str = "",
+        stress_context: str = "",
+        safety_notes: str = ""
+    ) -> str:
+        """
+        Adds a memory event.
+
+        AMM is only allowed when consent_confirmed=True.
+        This keeps the system aligned with the EchoWiring ethical rule:
+        no covert memory shaping.
+        """
+
+        if amm_enabled and not consent_confirmed:
+            raise ValueError(
+                "AMM/EchoWiring cannot be enabled without confirmed consent."
+            )
+
+        when_utc = datetime.now(timezone.utc).isoformat()
+        tags = tags or []
+
+        raw = f"{who}|{when_utc}|{what}|{why}|{context}|{outcome}|{audio_cue}|{recall_phrase}"
+        event_id = self._make_id(raw)
+
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+            INSERT OR REPLACE INTO learning_events (
+                id, who, when_utc, what, why, context, outcome, lesson,
+                confidence, tags,
+                amm_enabled, consent_confirmed, audio_cue, rhythm_pattern,
+                emotional_tone, recall_phrase, stress_context, safety_notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                event_id,
+                who,
+                when_utc,
+                what,
+                why,
+                context,
+                outcome,
+                lesson,
+                confidence,
+                json.dumps(tags),
+
+                int(amm_enabled),
+                int(consent_confirmed),
+                audio_cue,
+                rhythm_pattern,
+                emotional_tone,
+                recall_phrase,
+                stress_context,
+                safety_notes
+            ))
+
+            conn.commit()
+
+        return event_id
+
+    def add_pattern(
+        self,
+        pattern_name: str,
+        description: str,
+        evidence: str,
+        prediction: str,
+        confidence: float,
+        tags: Optional[List[str]] = None
+    ) -> str:
+        now = datetime.now(timezone.utc).isoformat()
+        tags = tags or []
+
+        raw = f"{pattern_name}|{description}|{prediction}"
+        pattern_id = self._make_id(raw)
+
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+            INSERT OR REPLACE INTO patterns (
+                id, pattern_name, description, evidence, prediction,
+                confidence, created_utc, updated_utc, tags
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                pattern_id,
+                pattern_name,
+                description,
+                evidence,
+                prediction,
+                confidence,
+                now,
+                now,
+                json.dumps(tags)
+            ))
+            conn.commit()
+
+        return pattern_id
+
+    def search_events(self, query: str, limit: int = 8) -> List[Dict]:
+        """
+        Simple keyword search.
+        Can later be replaced with vector embeddings.
+        """
+
+        terms = [term.lower() for term in query.split() if term.strip()]
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM learning_events ORDER BY when_utc DESC")
+            rows = cur.fetchall()
+
+        scored = []
+
+        for row in rows:
+            item = dict(row)
+
+            searchable_text = " ".join([
+                item.get("who") or "",
+                item.get("what") or "",
+                item.get("why") or "",
+                item.get("context") or "",
+                item.get("outcome") or "",
+                item.get("lesson") or "",
+                item.get("tags") or "",
+                item.get("audio_cue") or "",
+                item.get("rhythm_pattern") or "",
+                item.get("emotional_tone") or "",
+                item.get("recall_phrase") or "",
+                item.get("stress_context") or "",
+                item.get("safety_notes") or ""
+            ]).lower()
+
+            score = sum(1 for term in terms if term in searchable_text)
+
+            if score > 0:
+                item["score"] = score
+                item["tags"] = json.loads(item.get("tags") or "[]")
+                scored.append(item)
+
+        scored.sort(key=lambda x: (x["score"], x["when_utc"]), reverse=True)
+        return scored[:limit]
+
+    def predict_from_context(self, current_context: str, limit: int = 5) -> Dict:
+        related_events = self.search_events(current_context, limit=limit)
+
+        if not related_events:
+            return {
+                "prediction": "No strong prior memory pattern found.",
+                "confidence": 0.1,
+                "relevant_lessons": [],
+                "amm_recall_cues": [],
+                "suggested_reasoning": (
+                    "Ask clarifying questions. Avoid assuming intent. "
+                    "Separate known facts from inference."
+                )
+            }
+
+        lessons = []
+        recall_cues = []
+        total_confidence = 0.0
+
+        for event in related_events:
+            total_confidence += float(event.get("confidence") or 0)
+
+            if event.get("lesson"):
+                lessons.append(event["lesson"])
+
+            if event.get("amm_enabled"):
+                recall_cues.append({
+                    "audio_cue": event.get("audio_cue") or "",
+                    "rhythm_pattern": event.get("rhythm_pattern") or "",
+                    "emotional_tone": event.get("emotional_tone") or "",
+                    "recall_phrase": event.get("recall_phrase") or "",
+                    "stress_context": event.get("stress_context") or "",
+                    "safety_notes": event.get("safety_notes") or ""
+                })
+
+        avg_confidence = total_confidence / max(len(related_events), 1)
+
+        return {
+            "prediction": "Relevant prior memory suggests this may follow a known pattern.",
+            "confidence": round(avg_confidence, 2),
+            "relevant_lessons": lessons,
+            "amm_recall_cues": recall_cues,
+            "related_events": related_events,
+            "suggested_reasoning": (
+                "Use prior lessons as context, not certainty. "
+                "If AMM cues are present, use them as recall anchors, not commands."
+            )
+        }
+
+    def build_llm_context(self, user_message: str) -> str:
+        """
+        Builds an LLM-ready memory context block.
+        This can be prepended to a model prompt.
+        """
+
+        packet = self.predict_from_context(user_message)
+
+        lines = [
+            "GHOSTCORE PREDICTIVE MEMORY CONTEXT",
+            "Use this as background memory, not absolute truth.",
+            f"Prediction: {packet['prediction']}",
+            f"Confidence: {packet['confidence']}",
+            "",
+            "Relevant lessons:"
+        ]
+
+        for lesson in packet.get("relevant_lessons", []):
+            lines.append(f"- {lesson}")
+
+        if packet.get("amm_recall_cues"):
+            lines.append("")
+            lines.append("EchoWiring / AMM recall cues:")
+            for cue in packet["amm_recall_cues"]:
+                lines.append(f"- Audio cue: {cue['audio_cue']}")
+                lines.append(f"  Rhythm: {cue['rhythm_pattern']}")
+                lines.append(f"  Emotional tone: {cue['emotional_tone']}")
+                lines.append(f"  Recall phrase: {cue['recall_phrase']}")
+                lines.append(f"  Stress context: {cue['stress_context']}")
+                lines.append(f"  Safety notes: {cue['safety_notes']}")
+
+        lines.append("")
+        lines.append(f"Current user message: {user_message}")
+
+        return "\n".join(lines)
+
+    def export_json(self, output_path: str = "ghostcore_echowiring_export.json"):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            cur.execute("SELECT * FROM learning_events ORDER BY when_utc DESC")
+            events = [dict(row) for row in cur.fetchall()]
+
+            cur.execute("SELECT * FROM patterns ORDER BY updated_utc DESC")
+            patterns = [dict(row) for row in cur.fetchall()]
+
+        payload = {
+            "exported_utc": datetime.now(timezone.utc).isoformat(),
+            "events": events,
+            "patterns": patterns
+        }
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+        return output_path
+
+
+if __name__ == "__main__":
+    memory = EchoWiringMemory()
+
+    # Example 1: forensic learning event with AMM disabled
+    memory.add_event(
+        who="user",
+        what="Observed login failure through default DFS authentication followed by AD success.",
+        why="User wanted to determine whether fallback authentication was normal, suspicious, or tied to a hidden transaction.",
+        context="Authentication logs, DFS failure, Active Directory success, payout correlation.",
+        outcome="The pattern is not automatically malicious, but becomes suspicious when paired with missing payout records or privilege-sensitive events.",
+        lesson=(
+            "Authentication fallback is not proof of compromise alone. "
+            "Correlate with timing, role, transaction events, device errors, and missing logs."
+        ),
+        confidence=0.84,
+        tags=["forensics", "authentication", "active_directory", "logs"]
+    )
+
+    # Example 2: EchoWiring-enabled learning event
+    memory.add_event(
+        who="operator",
+        what="Learned emergency oxygen loop calibration sequence.",
+        why="Procedure must be recalled under panic, alarm noise, and cognitive overload.",
+        context="Spacecraft emergency procedure training.",
+        outcome="Recall improved when paired with a slow four-beat breathing rhythm.",
+        lesson=(
+            "For emergency procedures, pair each step with a stable rhythm and a short recall phrase."
+        ),
+        confidence=0.78,
+        tags=["AMM", "EchoWiring", "training", "emergency_recall"],
+
+        amm_enabled=True,
+        consent_confirmed=True,
+        audio_cue="low cello drone in E minor",
+        rhythm_pattern="4-count inhale, 4-count hold, 4-count action",
+        emotional_tone="calm urgency",
+        recall_phrase="The reactor remembers the melody.",
+        stress_context="alarm state, low oxygen, operator panic",
+        safety_notes=(
+            "Use only with consent. Do not use for covert conditioning. "
+            "Avoid trauma-linked tones unless supervised."
+        )
+    )
+
+    # Example query
+    user_message = "How should the AI remember emergency procedures under stress?"
+    print(memory.build_llm_context(user_message))
+
+    # Optional export
+    exported = memory.export_json()
+    print(f"\nExported memory archive to: {exported}")
 MAX_KNOWLEDGE_FILE_BYTES = 1_000_000
 
 logger = logging.getLogger("PortableLLM")
@@ -556,6 +930,7 @@ class SelfImprovementStore:
             guidance.append("When context exists, explicitly cite what was used from ingested knowledge.")
 
         return guidance[:4]
+
     def close(self) -> None:
         with self._lock:
             self.conn.close()
@@ -673,6 +1048,7 @@ class PortableLLM:
         self.echowiring_memory = self._create_echowiring_memory()
         self.cognitive_engine = self._create_cognitive_engine()
         self.search_augmentation = self._create_search_augmentation()
+        self.introspective_learning = self._create_introspective_learning()
 
         self.stats = LLMStats()
         self._quality_threshold = 72
@@ -741,29 +1117,28 @@ class PortableLLM:
             prompt = f"{prompt}\n\n{style_match.group(1).strip()}"
 
         return prompt
+
     def _enrich_prompt_with_search_if_needed(
         self,
         enriched: EnrichedPrompt,
         prompt: str,
         profile: PromptProfile,
     ) -> EnrichedPrompt:
-        """
-        Add online search context only when local context/model knowledge is likely insufficient.
-        """
+        """Look up information every time when enabled, but keep lookup context hidden.
 
+        Search context is added only for model-backed providers. The fallback provider
+        gets the original prompt so it does not regurgitate snippets or wrapper text.
+        """
         if not getattr(self, "search_augmentation", None):
             return enriched
-
-        decision = self.search_augmentation.should_search(
-            prompt=prompt,
-            local_context=enriched.context_preview,
-            quality_score=None,
-        )
-
-        if not decision.should_search:
+        if not getattr(self.search_augmentation, "allow_network", False):
             return enriched
 
-        search_context = self.search_augmentation.search_and_build_context(prompt)
+        try:
+            search_context = self.search_augmentation.search_and_build_context(prompt)
+        except Exception as exc:
+            logger.warning("Search augmentation failed: %s", exc)
+            return enriched
 
         if not search_context.strip():
             return enriched
@@ -771,21 +1146,17 @@ class PortableLLM:
         merged_text = (
             f"{enriched.text}\n\n"
             f"{search_context}\n\n"
-            "Search usage rule: Use online context only if it directly answers the user's question. "
-            "Do not let unrelated search results override a simple general answer."
+            "Lookup rule: Use search as supporting evidence. Do not quote irrelevant snippets. "
+            "Answer the user's actual question directly and naturally. "
+            "Never expose internal context labels to the user."
         )
-
-        preview = (
-            f"{enriched.context_preview}\n\n{search_context}"
-            if enriched.context_preview
-            else search_context
-        )
-
+        preview = (enriched.context_preview + "\n\n" + search_context).strip() if enriched.context_preview else search_context
         return EnrichedPrompt(
             text=merged_text,
-            has_context=True,
+            has_context=enriched.has_context,  # search alone must not trigger grounded rescue
             context_preview=preview[:MAX_KNOWLEDGE_CONTEXT_CHARS],
         )
+
     @staticmethod
     def _load_ollama_smart_content() -> str:
         """Load the smart Ollama response contract from the companion text file without executing it."""
@@ -833,8 +1204,8 @@ class PortableLLM:
         - ./Modules/<file_name>
         - ./<file_name>
 
-        The loader accepts both .py and .txt variants so the portable LLM works with
-        either normal Python modules or text-wrapped module exports.
+        Accepts both .py and .txt variants so the portable LLM works with
+        normal Python modules or text-wrapped module exports.
         """
         base_dir = Path(__file__).resolve().parent
         requested = Path(file_name)
@@ -935,6 +1306,19 @@ class PortableLLM:
             logger.warning("Search augmentation module unavailable: %s", exc)
             return None
 
+    def _create_introspective_learning(self):
+        """Attach the Introspective Learning module when present."""
+        module = self._load_text_module("perseus_introspective_learning", INTROSPECTIVE_LEARNING_MODULE_FILE)
+        cls = getattr(module, "IntrospectiveLearning", None) if module else None
+        if not cls:
+            return None
+
+        try:
+            return cls(db_path=self._module_db_path(INTROSPECTIVE_LEARNING_DB_PATH))
+        except Exception as exc:
+            logger.warning("Introspective learning module unavailable: %s", exc)
+            return None
+
     def available_providers(self) -> List[str]:
         """Return available providers from existing conversation core."""
         return self.manager.get_available_providers()
@@ -963,6 +1347,7 @@ class PortableLLM:
             self.conversation.max_tokens = int(max_tokens)
 
         profile = self._profile_prompt(prompt)
+        introspection_meta = None
         enriched = self._enrich_prompt_with_knowledge(prompt)
         enriched = self._enrich_prompt_with_predictive_modules(enriched, prompt)
         enriched = self._enrich_prompt_with_search_if_needed(enriched, prompt, profile)
@@ -994,6 +1379,37 @@ class PortableLLM:
             quality = self._assess_quality(response, profile, has_context=True)
             refined = True
 
+        if response and str(response).strip() and _is_bad_user_visible_response(str(response)):
+            response = _safe_visible_answer(prompt, str(response))
+            provider_used = "safe-fallback"
+            quality = self._assess_quality(response, profile, has_context=False)
+            refined = True
+
+        if response and str(response).strip() and getattr(self, "introspective_learning", None):
+            try:
+                revised_response, critique = self.introspective_learning.analyze_and_correct(
+                    user_prompt=prompt,
+                    response_text=str(response),
+                    rewrite_callback=None,
+                    search_context=enriched.context_preview,
+                )
+                introspection_meta = {
+                    "answered_question": getattr(critique, "answered_question", None),
+                    "directness_score": getattr(critique, "directness_score", None),
+                    "relevance_score": getattr(critique, "relevance_score", None),
+                    "completeness_score": getattr(critique, "completeness_score", None),
+                    "leakage_detected": getattr(critique, "leakage_detected", None),
+                    "harmful_scaffolding_detected": getattr(critique, "harmful_scaffolding_detected", None),
+                    "issues": list(getattr(critique, "issues", []) or [])[:6],
+                    "repaired": revised_response.strip() != str(response).strip(),
+                }
+                if revised_response and revised_response.strip() != str(response).strip():
+                    response = revised_response.strip()
+                    refined = True
+                    quality = self._assess_quality(response, profile, has_context=False)
+            except Exception as exc:
+                logger.warning("Introspective learning repair failed: %s", exc)
+
         if response and str(response).strip():
             model_used = self.model if provider_used == self.provider else self._default_model_for(provider_used)
             self.improvement_store.record(
@@ -1015,6 +1431,7 @@ class PortableLLM:
                     "refined": refined,
                     "offline": used_offline,
                     "grounded_with_ingested_context": enriched.has_context,
+                    "introspection": introspection_meta,
                 },
             )
             self.manager._save_conversation(self.conversation)
@@ -1047,6 +1464,7 @@ class PortableLLM:
                 "grounded_with_ingested_context": enriched.has_context,
                 "context_preview": enriched.context_preview,
                 "strict_local_only": self.strict_local_only,
+                "introspection": introspection_meta,
             }
             return response, metadata
 
@@ -1092,9 +1510,7 @@ class PortableLLM:
             "echowiring_memory_enabled": bool(self.echowiring_memory),
             "cognitive_functions_enabled": bool(self.cognitive_engine),
             "search_augmentation_enabled": bool(getattr(self, "search_augmentation", None)),
-            "online_search_enabled": bool(
-                getattr(getattr(self, "search_augmentation", None), "allow_network", False)
-            ),
+            "online_search_enabled": bool(getattr(getattr(self, "search_augmentation", None), "allow_network", False)),
         }
 
     def set_provider(self, provider: str, model: Optional[str] = None) -> bool:
@@ -1117,6 +1533,19 @@ class PortableLLM:
             self.web_learner.close()
         if self.offline:
             self.offline.close()
+
+    def purge_introspective_traces(self) -> Dict[str, int]:
+        """Purge leaky introspective traces from the local introspection database."""
+        if not getattr(self, "introspective_learning", None):
+            return {"deleted": 0, "reason": "introspective learning module not loaded"}
+        purge = getattr(self.introspective_learning, "purge_leaky_traces", None)
+        if not callable(purge):
+            return {"deleted": 0, "reason": "purge_leaky_traces not available"}
+        try:
+            return purge()
+        except Exception as exc:
+            logger.warning("Introspective trace purge failed: %s", exc)
+            return {"deleted": 0, "error": str(exc)}
 
     def ingest_web_content(self, url: str, content: str, title: str = "") -> Dict[str, object]:
         """Ingest webpage content into knowledge store for future conversations."""
@@ -1707,38 +2136,6 @@ class PortableLLM:
             pass
         self.web_learner = None
 
-    @staticmethod
-    def _knowledge_relevance_terms(prompt: str) -> List[str]:
-        """Extract meaningful terms for checking whether retrieved knowledge actually matches the prompt."""
-        text = _extract_user_request(prompt).lower()
-        terms = re.findall(r"[a-zA-Z0-9_-]{3,}", text)
-        stop = MEMORY_RETRIEVAL_STOPWORDS | {
-            "tell", "about", "describe", "overview", "summary", "please", "give",
-            "what", "are", "the", "and", "for", "you", "with", "from"
-        }
-        return [term for term in terms if term not in stop]
-
-    @classmethod
-    def _knowledge_context_is_relevant(cls, prompt: str, context: str) -> bool:
-        """
-        Prevent random learned news/web snippets from hijacking simple general questions.
-
-        Example fixed:
-        User: "tell me about stars"
-        Old behavior: Guardian/BBC context was treated as relevant and forced a grounded fallback.
-        New behavior: context must share meaningful prompt terms or we skip learned-context injection.
-        """
-        terms = cls._knowledge_relevance_terms(prompt)
-        if not terms:
-            return False
-
-        lower_context = (context or "").lower()
-        matched = [term for term in terms if term in lower_context]
-
-        # One specific term is enough for simple topics like "stars";
-        # multi-term requests need at least one strong overlap.
-        return bool(matched)
-
     def _enrich_prompt_with_knowledge(self, prompt: str) -> EnrichedPrompt:
         """Inject relevant learned web context into the prompt when available."""
         if (
@@ -1758,9 +2155,6 @@ class PortableLLM:
             return EnrichedPrompt(text=prompt, has_context=False)
 
         if not context:
-            return EnrichedPrompt(text=prompt, has_context=False)
-
-        if not self._knowledge_context_is_relevant(prompt, context):
             return EnrichedPrompt(text=prompt, has_context=False)
 
         preview = context[:1200].replace("\n", " ").strip()
@@ -1786,6 +2180,11 @@ class PortableLLM:
 
     def _enrich_prompt_with_predictive_modules(self, enriched: EnrichedPrompt, prompt: str) -> EnrichedPrompt:
         """Inject context from the three Modules/ learning engines when available."""
+        # Do not wrap ordinary general-knowledge/cooking/safety questions in predictive memory.
+        # Otherwise the fallback may answer the wrapper instead of the user's actual question.
+        if _is_general_knowledge_prompt(prompt) and not _is_memory_prompt(prompt):
+            return enriched
+
         module_context = self._build_predictive_module_context(prompt)
         if not module_context:
             return enriched
@@ -2018,9 +2417,6 @@ class PortableLLM:
             for token in [
                 "teach",
                 "explain",
-                "tell me about",
-                "describe",
-                "overview",
                 "what is",
                 "what are",
                 "who ",
@@ -2157,8 +2553,11 @@ class PortableLLM:
         model = self.model if provider_name == self.provider else self._default_model_for(provider_name)
 
         try:
+            # The simple fallback provider should never see enriched memory/search wrappers.
+            # It is not a real LLM; it answers the visible user request only.
+            provider_prompt = _extract_user_request(prompt) if provider_name == "fallback" else prompt
             return provider.generate(
-                prompt,
+                provider_prompt,
                 messages=messages,
                 model=model,
                 temperature=self.conversation.temperature,
@@ -2926,11 +3325,38 @@ def _build_folder_index_content(root: Path, files: List[Path], learned_titles: L
 
 
 def _extract_user_request(prompt: str) -> str:
-    """Recover the original user request from an enriched prompt when present."""
+    """Recover the original user request from enriched/wrapped prompts.
+
+    This prevents internal memory/search wrapper text from leaking into the fallback answer.
+    """
     text = (prompt or "").strip()
-    marker = "User request:"
-    if marker in text:
-        return text.rsplit(marker, 1)[1].strip()
+    if not text:
+        return ""
+
+    markers = [
+        "Current prompt payload:",
+        "User request:",
+        "Original question:",
+        "Request to ground:",
+        "Current user message:",
+        "USER QUESTION:",
+    ]
+    for marker in markers:
+        if marker in text:
+            text = text.rsplit(marker, 1)[1].strip()
+
+    # If a search/memory context was appended after the user request, discard it.
+    hard_stops = [
+        "\n\nONLINE SEARCH CONTEXT",
+        "\n\nPREDICTIVE LEARNING CONTEXT",
+        "\n\nASYNCHRONOUS / ECHOWIRING LEARNING CONTEXT",
+        "\n\nCOGNITIVE FUNCTIONS CONTEXT",
+        "\n\nSearch usage rule:",
+    ]
+    for stop in hard_stops:
+        if stop in text:
+            text = text.split(stop, 1)[0].strip()
+
     return text
 
 
@@ -3013,10 +3439,6 @@ def _is_general_knowledge_prompt(prompt: str) -> bool:
         "what is ",
         "what are ",
         "explain ",
-        "tell me about ",
-        "describe ",
-        "give me an overview of ",
-        "give me a summary of ",
     )
     domain_markers = [
         "princess protocol",
@@ -3071,6 +3493,72 @@ def _context_preview_bullets(context: str, max_bullets: int = 6) -> List[str]:
         if len(bullets) >= max_bullets:
             break
     return bullets
+
+
+def _is_bad_user_visible_response(response: str) -> bool:
+    """Detect internal scaffold/wrapper leakage that should never reach the user."""
+    lower = re.sub(r"\s+", " ", (response or "").lower())
+    bad_markers = [
+        "knowledge response:",
+        "question anatomy for",
+        "current prompt payload:",
+        "predictive learning context",
+        "asynchronous / echowiring",
+        "cognitive functions context",
+        "direct answer: for `",
+        "request to ground:",
+        "you have additional predictive/cognitive learning context",
+    ]
+    return any(marker in lower for marker in bad_markers)
+
+
+
+def _simple_recipe_fallback(prompt: str) -> str:
+    """Direct cooking answers for common fallback cases."""
+    lower = re.sub(r"\s+", " ", _extract_user_request(prompt).lower()).strip(" .!?\t\r\n")
+
+    if "white rice" in lower and any(word in lower for word in ["make", "cook", "prepare", "how to"]):
+        return (
+            "To make white rice, rinse 1 cup of rice until the water runs mostly clear, then add it to a pot with about 2 cups of water and a pinch of salt. "
+            "Bring it to a boil, reduce to low, cover, and simmer for about 15 to 18 minutes. Turn off the heat and let it sit covered for 5 to 10 minutes, then fluff with a fork. "
+            "For firmer rice, use a little less water; for softer rice, use a little more."
+        )
+
+    if "spaghetti" in lower and any(word in lower for word in ["make", "cook", "prepare", "boil", "how to"]):
+        return (
+            "To make spaghetti, bring a large pot of salted water to a boil, add the pasta, and cook until tender but still slightly firm, usually 8 to 12 minutes depending on the package. "
+            "Drain it, then toss it with sauce such as marinara, meat sauce, or garlic and olive oil."
+        )
+
+    return ""
+
+
+def _safe_visible_answer(prompt: str, prior_response: str = "") -> str:
+    """Last-resort user-visible answer that never exposes internal wrappers."""
+    direct = _general_knowledge_fallback(prompt)
+    if direct:
+        return direct
+
+    clean_prompt = _extract_user_request(prompt)
+    lower = re.sub(r"\s+", " ", clean_prompt.lower()).strip(" .!?\t\r\n")
+
+    if _is_small_talk_prompt(clean_prompt):
+        if "how are you" in lower or "how's it going" in lower or "how is it going" in lower:
+            return "I'm doing alright — awake, local, and ready to help. What are we working on?"
+        if "thank" in lower or "thanks" in lower:
+            return "You're welcome."
+        return "Hey — I'm here. What would you like to work on?"
+
+    recipe = _simple_recipe_fallback(clean_prompt)
+    if recipe:
+        return recipe
+
+    heuristic = _heuristic_general_answer(prompt)
+    if heuristic and not _is_bad_user_visible_response(heuristic):
+        return heuristic
+
+    # Do not show the user a meta-answer about context. Give a plain recovery line instead.
+    return "I can help with that. Please ask it again in one sentence and I’ll answer directly."
 
 
 def _format_prediction_packet(label: str, packet: Dict[str, object]) -> str:
@@ -3194,6 +3682,10 @@ def _general_knowledge_fallback(prompt: str) -> str:
     lower = re.sub(r"\s+", " ", text.lower()).strip(" .!?\t\r\n")
     lower = re.sub(r"\bhte\b", "the", lower)
 
+    recipe = _simple_recipe_fallback(lower)
+    if recipe:
+        return recipe
+
     if re.fullmatch(r"is\s+[-+]?\d+(\.\d+)?\s+a\s+number", lower):
         value = re.search(r"[-+]?\d+(\.\d+)?", lower).group(0)
         return (
@@ -3254,14 +3746,36 @@ def _general_knowledge_fallback(prompt: str) -> str:
             "wetness describes the interaction between a liquid and a surface."
         )
 
-
-    if lower in {"tell me about stars", "stars"} or re.fullmatch(r"(?:what are|what is|explain|describe|tell me about) stars", lower):
+    if ("how hot" in lower or "what temperature" in lower or "temperature" in lower) and "water" in lower and "boil" in lower:
         return (
-            "Stars are huge, glowing balls of plasma held together by gravity. They shine because nuclear fusion in their cores "
-            "turns lighter elements, mostly hydrogen, into heavier elements, releasing energy as light and heat. Our Sun is a star. "
-            "Stars form inside cold clouds of gas and dust, spend most of their lives fusing hydrogen, and eventually die in different "
-            "ways depending on their mass: smaller stars fade into white dwarfs, while massive stars can explode as supernovae and leave "
-            "behind neutron stars or black holes. They matter because they make many of the heavier elements planets and living things are built from."
+            "Water boils at about 100°C or 212°F at sea level under normal air pressure. "
+            "At higher altitudes it boils at a lower temperature because air pressure is lower; under higher pressure, "
+            "like in a pressure cooker, it boils at a higher temperature."
+        )
+
+    if ("how deep" in lower and "ocean" in lower) or lower in {"how deep is the ocean", "how deep are the oceans"}:
+        return (
+            "The ocean is about 3.7 kilometers deep on average, roughly 12,100 feet. "
+            "The deepest known point is Challenger Deep in the Mariana Trench, about 10.9 to 11 kilometers deep, "
+            "or around 36,000 feet."
+        )
+
+    if ("how to make spaghetti" in lower or "make spaghetti" in lower or "cook spaghetti" in lower):
+        return (
+            "To make spaghetti: bring a large pot of salted water to a boil, add the spaghetti, and cook until tender "
+            "but still slightly firm, usually about 8 to 12 minutes depending on the package. While it cooks, warm a sauce "
+            "in a pan. Drain the pasta, save a little pasta water, then toss the spaghetti with the sauce. Add a splash of "
+            "pasta water if the sauce needs loosening, then finish with cheese, herbs, or olive oil if you like."
+        )
+
+    if (("fall" in lower or "fell" in lower) and re.search(r"\b10\s*(feet|foot|ft)\b", lower)):
+        return (
+            "A 10-foot fall can range from minor bruising to serious injury depending on how you land, your age/health, "
+            "and the surface. Ankles, wrists, knees, ribs, back, neck, and head are common concern areas. "
+            "Seek urgent medical care now if you hit your head, lost consciousness, have neck/back pain, numbness, weakness, "
+            "trouble breathing, severe swelling, deformity, heavy bleeding, confusion, vomiting, or cannot walk/bear weight. "
+            "If symptoms are mild, rest, avoid stressing the injured area, use ice wrapped in cloth, and monitor closely; "
+            "worsening pain or neurological symptoms should be checked immediately."
         )
 
     return ""
