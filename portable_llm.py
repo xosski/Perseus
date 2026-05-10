@@ -642,6 +642,7 @@ class PortableLLM:
         model: Optional[str] = None,
         use_offline_fallback: bool = False,
         strict_local_only: bool = True,
+        allow_online_search: bool = True,
         system_prompt: str = (
             "You are Perseus, a smart, practical technical assistant. "
             "Provide accurate, genuine, context-aware responses with candid, intelligent feedback. "
@@ -653,6 +654,7 @@ class PortableLLM:
         ),
     ):
         self.strict_local_only = bool(strict_local_only)
+        self.allow_online_search = bool(allow_online_search)
         self._local_provider_order = ["ollama", "fallback"]
         self.manager = ConversationManager(db_path=db_path)
         self.offline = (
@@ -927,7 +929,7 @@ class PortableLLM:
                 db_path=self._module_db_path(SEARCH_CACHE_DB_PATH),
                 max_results=5,
                 timeout_seconds=8,
-                allow_network=not self.strict_local_only,
+                allow_network=self.allow_online_search,
             )
         except Exception as exc:
             logger.warning("Search augmentation module unavailable: %s", exc)
@@ -1090,6 +1092,9 @@ class PortableLLM:
             "echowiring_memory_enabled": bool(self.echowiring_memory),
             "cognitive_functions_enabled": bool(self.cognitive_engine),
             "search_augmentation_enabled": bool(getattr(self, "search_augmentation", None)),
+            "online_search_enabled": bool(
+                getattr(getattr(self, "search_augmentation", None), "allow_network", False)
+            ),
         }
 
     def set_provider(self, provider: str, model: Optional[str] = None) -> bool:
@@ -2438,6 +2443,7 @@ def launch_portable_llm_chat(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     strict_local_only: bool = True,
+    allow_online_search: bool = True,
     use_offline_fallback: bool = False,
     knowledge_folders: Optional[List[str]] = None,
     auto_ingest_folders: bool = True,
@@ -2453,6 +2459,7 @@ def launch_portable_llm_chat(
         provider=provider,
         model=model,
         strict_local_only=strict_local_only,
+        allow_online_search=allow_online_search,
         use_offline_fallback=use_offline_fallback,
     )
     startup_knowledge_folders = knowledge_folders or list(DEFAULT_AUTO_KNOWLEDGE_FOLDERS)
@@ -2826,6 +2833,7 @@ def launch_portable_llm_terminal_chat(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     strict_local_only: bool = True,
+    allow_online_search: bool = True,
     use_offline_fallback: bool = False,
     knowledge_folders: Optional[List[str]] = None,
     auto_ingest_folders: bool = True,
@@ -2836,6 +2844,7 @@ def launch_portable_llm_terminal_chat(
         provider=provider,
         model=model,
         strict_local_only=strict_local_only,
+        allow_online_search=allow_online_search,
         use_offline_fallback=use_offline_fallback,
     )
     startup_knowledge_folders = knowledge_folders or list(DEFAULT_AUTO_KNOWLEDGE_FOLDERS)

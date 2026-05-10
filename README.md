@@ -8,6 +8,7 @@ This folder provides a standard, portable LLM layer built using the existing Had
 - `ollama` as the default strict local-only generation backend
 - A built-in local knowledge response path that keeps the app focused on learned sources when a generative model is not active
 - `offline_llm.OfflineLLM` as an optional enhanced fallback path only when installed and explicitly enabled
+- Online search augmentation for explicit/current-information questions, while still keeping the LLM provider local by default
 
 ## Response Sophistication
 
@@ -108,6 +109,12 @@ Enable non-strict mode (allows fallbacks/remotes):
 python cli.py --allow-fallbacks
 ```
 
+Disable online search augmentation if you want a fully offline session:
+
+```bash
+python cli.py --no-online-search
+```
+
 Enable OfflineLLM fallback (only works with `--allow-fallbacks`):
 
 ```bash
@@ -160,6 +167,7 @@ llm.close()
 ## Portability Notes
 
 - Defaults to strict local-only mode and prefers a local provider (`ollama`)
+- Online search is enabled by default for explicit or current-information lookup requests; use `--no-online-search` to disable it
 - If a generative model is not active, the built-in local path keeps the app centered on ingested knowledge instead of web browsing
 - In strict mode, remote providers are blocked and provider switching is limited to local providers
 - If local provider output is weak, one refinement pass is attempted before returning best local result

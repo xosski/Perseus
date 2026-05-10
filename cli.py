@@ -26,6 +26,11 @@ def run() -> int:
         help="Disable strict local-only mode and allow remote/fallback providers",
     )
     parser.add_argument(
+        "--no-online-search",
+        action="store_true",
+        help="Disable online web search augmentation while keeping other features enabled",
+    )
+    parser.add_argument(
         "--use-offline-fallback",
         action="store_true",
         help="Enable OfflineLLM fallback (only used when --allow-fallbacks is set)",
@@ -52,6 +57,7 @@ def run() -> int:
         provider=args.provider,
         model=args.model,
         strict_local_only=not args.allow_fallbacks,
+        allow_online_search=not args.no_online_search,
         use_offline_fallback=args.use_offline_fallback,
         knowledge_folders=args.knowledge_folder,
         auto_ingest_folders=not args.no_auto_ingest_folders,

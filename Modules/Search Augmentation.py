@@ -30,7 +30,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from html import unescape
 from typing import Dict, List, Optional
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
@@ -424,7 +424,7 @@ class SearchAugmentation:
         for url, title, snippet in blocks[: self.max_results]:
             title = self._strip_html(title)
             snippet = self._strip_html(snippet)
-            url = unescape(url)
+            url = self._normalize_duckduckgo_url(unescape(url))
 
             if url:
                 results.append(
@@ -486,6 +486,15 @@ class SearchAugmentation:
         text = unescape(text)
         text = re.sub(r"\s+", " ", text).strip()
         return text
+
+    def _normalize_duckduckgo_url(self, url: str) -> str:
+        """Return the real result URL from DuckDuckGo redirect links when present."""
+        parsed = urlparse(url or "")
+        if parsed.netloc.lower().endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+            target = (parse_qs(parsed.query).get("uddg") or [""])[0]
+            if target:
+                return unquote(target)
+        return url
 
     def _dedupe_results(self, results: List[SearchResult]) -> List[SearchResult]:
         seen = set()
