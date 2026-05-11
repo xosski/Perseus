@@ -207,6 +207,10 @@ class SearchAugmentation:
         if re.search(r"\b20(?:2[4-9]|3\d)\b", prompt_lower):
             return SearchDecision(True, "Question includes a recent or future year.", 0.78)
 
+        factual_lookup_pattern = r"^(?:tell me about|what is|what are|who is|who are|where is|where are|when is|when did|how is|how are|how does|how do)\b"
+        if not (local_context or "").strip() and re.search(factual_lookup_pattern, prompt_lower):
+            return SearchDecision(True, "No local context was found for a factual lookup-style question.", 0.72)
+
         if quality_score is not None and quality_score < 60:
             return SearchDecision(True, "Draft quality score is low.", 0.75)
 
@@ -233,7 +237,8 @@ class SearchAugmentation:
         if not query:
             return []
 
-        cached = None if force_refresh else self._get_cached(query)
+        is_weather_query = self._is_weather_query(query)
+        cached = None if force_refresh or is_weather_query else self._get_cached(query)
         if cached is not None:
             return cached[: self.max_results]
 
@@ -242,7 +247,10 @@ class SearchAugmentation:
 
         results: List[SearchResult] = []
 
-        if self.brave_key:
+        if is_weather_query:
+            results = self._search_weather(query)
+
+        if not results and self.brave_key:
             results = self._search_brave(query)
 
         if not results and self.serper_key:
@@ -332,6 +340,78 @@ class SearchAugmentation:
             for item in items
             if item.get("link")
         ]
+
+    @staticmethod
+    def _is_weather_query(query: str) -> bool:
+        lower = (query or "").lower()
+        return "weather" in lower or "forecast" in lower or "temperature" in lower
+
+    def _search_weather(self, query: str) -> List[SearchResult]:
+        location = self._weather_location(query)
+        if not location:
+            return []
+
+        data = self._request_json(
+            f"https://wttr.in/{quote_plus(location)}?format=j1",
+            headers={"Accept": "application/json"},
+        )
+        current = ((data or {}).get("current_condition") or [{}])[0]
+        nearest = ((data or {}).get("nearest_area") or [{}])[0]
+        if not current:
+            return []
+
+        area = self._weather_area_name(nearest) or location
+        condition = self._weather_value(current.get("weatherDesc")) or "conditions unavailable"
+        temp_f = current.get("temp_F") or "?"
+        feels_f = current.get("FeelsLikeF") or "?"
+        humidity = current.get("humidity") or "?"
+        wind_mph = current.get("windspeedMiles") or "?"
+        observation = current.get("localObsDateTime") or self._now_utc()
+        snippet = (
+            f"Current weather for {area}: {condition}, {temp_f}°F, feels like {feels_f}°F, "
+            f"humidity {humidity}%, wind {wind_mph} mph. Observation time: {observation}."
+        )
+        return [
+            SearchResult(
+                title=f"Current weather for {area}",
+                url=f"https://wttr.in/{quote_plus(location)}",
+                snippet=snippet,
+                source="wttr.in",
+                retrieved_utc=self._now_utc(),
+            )
+        ]
+
+    @staticmethod
+    def _weather_location(query: str) -> str:
+        text = re.sub(r"\s+", " ", (query or "")).strip(" ?.!" )
+        match = re.search(r"\b(?:in|for|at|near)\s+(.+)$", text, flags=re.IGNORECASE)
+        if match:
+            location = match.group(1)
+        else:
+            location = re.sub(
+                r"\b(?:what(?:'s| is)?|how is|the|weather|forecast|temperature|today|right now|current)\b",
+                " ",
+                text,
+                flags=re.IGNORECASE,
+            )
+        location = re.sub(r"\s+", " ", location).strip(" ?.!,")
+        return location or ""
+
+    @staticmethod
+    def _weather_value(values) -> str:
+        if isinstance(values, list) and values:
+            value = values[0]
+            if isinstance(value, dict):
+                return str(value.get("value") or "").strip()
+        if isinstance(values, str):
+            return values.strip()
+        return ""
+
+    def _weather_area_name(self, nearest: Dict) -> str:
+        area = self._weather_value(nearest.get("areaName"))
+        region = self._weather_value(nearest.get("region"))
+        country = self._weather_value(nearest.get("country"))
+        return ", ".join(part for part in [area, region, country] if part)
 
     def _search_wikipedia(self, query: str) -> List[SearchResult]:
         topic = re.sub(r"^(tell me about|what is|who is|explain)\s+", "", query.strip(), flags=re.I)

@@ -128,6 +128,9 @@ except ImportError:
             if _is_capability_prompt(user_prompt):
                 return _capability_response()
 
+            if "ONLINE SEARCH CONTEXT" in (prompt or ""):
+                return _answer_from_online_search_context(prompt, user_prompt)
+
             general_answer = _general_knowledge_fallback(user_prompt)
             if general_answer:
                 return general_answer
@@ -400,13 +403,13 @@ MODULES_FOLDER = "Modules"
 PREDICTIVE_LEARNING_MODULE_FILE = "Predictive learning.txt"
 ASYNCHRONOUS_LEARNING_MODULE_FILE = "Asyncronous Learning.txt"
 COGNITIVE_FUNCTIONS_MODULE_FILE = "Cognitive Functions.txt"
+BRAIN_STATE_MODULE_FILE = "Brain State.py"
 SEARCH_AUGMENTATION_MODULE_FILE = "Search Augmentation.py"
-INTROSPECTIVE_LEARNING_MODULE_FILE = "Introspective Learning.py"
-SEARCH_CACHE_DB_PATH = "llm_search_cache.db"
-INTROSPECTIVE_LEARNING_DB_PATH = "introspective_learning.db"
+BRAIN_STATE_DB_PATH = "brain_state_memory.db"
 PREDICTIVE_LEARNING_DB_PATH = "predictive_learning_memory.db"
 ECHOWIRING_MEMORY_DB_PATH = "ghostcore_echowiring_memory.db"
 COGNITIVE_STATE_DB_PATH = "ghostcore_cognitive_state.db"
+SEARCH_CACHE_DB_PATH = "llm_search_cache.db"
 SUPPORTED_KNOWLEDGE_EXTENSIONS = {
     ".txt",
     ".md",
@@ -841,10 +844,6 @@ class EnrichedPrompt:
     text: str
     has_context: bool
     context_preview: str = ""
-    search_performed: bool = False
-    search_context: str = ""
-    search_reason: str = ""
-    search_result_count: int = 0
 
 
 class SelfImprovementStore:
@@ -1051,8 +1050,10 @@ class PortableLLM:
         self.predictive_memory = self._create_predictive_memory()
         self.echowiring_memory = self._create_echowiring_memory()
         self.cognitive_engine = self._create_cognitive_engine()
+        self.brain_state_engine = self._create_brain_state_engine()
         self.search_augmentation = self._create_search_augmentation()
-        self.introspective_learning = self._create_introspective_learning()
+        self._active_brain_action = None
+        self._active_brain_context = ""
 
         self.stats = LLMStats()
         self._quality_threshold = 72
@@ -1122,80 +1123,6 @@ class PortableLLM:
 
         return prompt
 
-    def _enrich_prompt_with_search_if_needed(
-        self,
-        enriched: EnrichedPrompt,
-        prompt: str,
-        profile: PromptProfile,
-        draft_response: str = "",
-        quality_score: Optional[int] = None,
-        force: bool = False,
-    ) -> EnrichedPrompt:
-        """Look up online information when the request or draft warrants it.
-
-        Model-backed providers receive compact lookup context. The deterministic
-        fallback path gets a purpose-built search summary instead of raw wrappers.
-        """
-        if not getattr(self, "search_augmentation", None):
-            return enriched
-        if not getattr(self.search_augmentation, "allow_network", False):
-            return enriched
-
-        decision = self.search_augmentation.should_search(
-            prompt=prompt,
-            local_context=enriched.context_preview,
-            draft_response=draft_response,
-            quality_score=quality_score,
-        )
-        if not force and not decision.should_search:
-            return EnrichedPrompt(
-                text=enriched.text,
-                has_context=enriched.has_context,
-                context_preview=enriched.context_preview,
-                search_performed=False,
-                search_context=enriched.search_context,
-                search_reason=decision.reason,
-                search_result_count=enriched.search_result_count,
-            )
-
-        try:
-            results = self.search_augmentation.search(prompt)
-            search_context = self.search_augmentation.build_search_context(prompt, results)
-        except Exception as exc:
-            logger.warning("Search augmentation failed: %s", exc)
-            return enriched
-
-        if not search_context.strip():
-            return EnrichedPrompt(
-                text=enriched.text,
-                has_context=enriched.has_context,
-                context_preview=enriched.context_preview,
-                search_performed=True,
-                search_context="",
-                search_reason=decision.reason,
-                search_result_count=0,
-            )
-
-        merged_text = (
-            f"{enriched.text}\n\n"
-            f"{search_context}\n\n"
-            "Lookup rule: Use search as supporting evidence. Include a short 'Online Lookup Used' "
-            "section with the source domains when the lookup materially affects the answer. "
-            "Do not quote irrelevant snippets. "
-            "Answer the user's actual question directly and naturally. "
-            "Never expose internal context labels to the user."
-        )
-        preview = (enriched.context_preview + "\n\n" + search_context).strip() if enriched.context_preview else search_context
-        return EnrichedPrompt(
-            text=merged_text,
-            has_context=enriched.has_context,  # search alone must not trigger grounded rescue
-            context_preview=preview[:MAX_KNOWLEDGE_CONTEXT_CHARS],
-            search_performed=True,
-            search_context=search_context,
-            search_reason=decision.reason,
-            search_result_count=len(results),
-        )
-
     @staticmethod
     def _load_ollama_smart_content() -> str:
         """Load the smart Ollama response contract from the companion text file without executing it."""
@@ -1238,37 +1165,9 @@ class PortableLLM:
 
     @staticmethod
     def _load_text_module(module_name: str, file_name: str):
-        """
-        Load one local Python-source module from either:
-        - ./Modules/<file_name>
-        - ./<file_name>
-
-        Accepts both .py and .txt variants so the portable LLM works with
-        normal Python modules or text-wrapped module exports.
-        """
-        base_dir = Path(__file__).resolve().parent
-        requested = Path(file_name)
-
-        names = [requested.name]
-        if requested.suffix.lower() == ".py":
-            names.append(requested.with_suffix(".txt").name)
-        elif requested.suffix.lower() == ".txt":
-            names.append(requested.with_suffix(".py").name)
-        else:
-            names.extend([requested.name + ".py", requested.name + ".txt"])
-
-        candidate_paths: List[Path] = []
-        for name in dict.fromkeys(names):
-            candidate_paths.append(base_dir / MODULES_FOLDER / name)
-            candidate_paths.append(base_dir / name)
-
-        path = next((candidate for candidate in candidate_paths if candidate.exists()), None)
-        if path is None:
-            logger.warning(
-                "Optional module %s not found. Checked: %s",
-                file_name,
-                ", ".join(str(candidate) for candidate in candidate_paths),
-            )
+        """Load one Python source module from the local Modules folder even though it is stored as .txt."""
+        path = Path(__file__).resolve().parent / MODULES_FOLDER / file_name
+        if not path.exists():
             return None
 
         try:
@@ -1278,7 +1177,6 @@ class PortableLLM:
             module.__package__ = ""
             sys.modules[module_name] = module
             exec(compile(source, str(path), "exec"), module.__dict__)
-            logger.info("Loaded optional module %s from %s", module_name, path)
             return module
         except Exception as exc:
             logger.warning("Unable to load module %s from %s: %s", module_name, path, exc)
@@ -1327,35 +1225,33 @@ class PortableLLM:
             logger.warning("Cognitive functions module unavailable: %s", exc)
             return None
 
+    def _create_brain_state_engine(self):
+        """Attach the deterministic Brain State module when present."""
+        module = self._load_text_module("perseus_brain_state", BRAIN_STATE_MODULE_FILE)
+        cls = getattr(module, "BrainStateEngine", None) if module else None
+        if not cls:
+            return None
+
+        try:
+            return cls(db_path=self._module_db_path(BRAIN_STATE_DB_PATH))
+        except Exception as exc:
+            logger.warning("Brain State module unavailable: %s", exc)
+            return None
+
     def _create_search_augmentation(self):
-        """Attach the Search Augmentation module when present."""
+        """Attach online search augmentation when the local module is present."""
+        if not self.allow_online_search:
+            return None
+
         module = self._load_text_module("perseus_search_augmentation", SEARCH_AUGMENTATION_MODULE_FILE)
         cls = getattr(module, "SearchAugmentation", None) if module else None
         if not cls:
             return None
 
         try:
-            return cls(
-                db_path=self._module_db_path(SEARCH_CACHE_DB_PATH),
-                max_results=5,
-                timeout_seconds=8,
-                allow_network=self.allow_online_search,
-            )
+            return cls(db_path=self._module_db_path(SEARCH_CACHE_DB_PATH), allow_network=self.allow_online_search)
         except Exception as exc:
             logger.warning("Search augmentation module unavailable: %s", exc)
-            return None
-
-    def _create_introspective_learning(self):
-        """Attach the Introspective Learning module when present."""
-        module = self._load_text_module("perseus_introspective_learning", INTROSPECTIVE_LEARNING_MODULE_FILE)
-        cls = getattr(module, "IntrospectiveLearning", None) if module else None
-        if not cls:
-            return None
-
-        try:
-            return cls(db_path=self._module_db_path(INTROSPECTIVE_LEARNING_DB_PATH))
-        except Exception as exc:
-            logger.warning("Introspective learning module unavailable: %s", exc)
             return None
 
     def available_providers(self) -> List[str]:
@@ -1386,10 +1282,35 @@ class PortableLLM:
             self.conversation.max_tokens = int(max_tokens)
 
         profile = self._profile_prompt(prompt)
-        introspection_meta = None
+        brain_meta = None
+        if getattr(self, "brain_state_engine", None):
+            try:
+                profile_packet = {
+                    "intent": profile.intent,
+                    "complexity": profile.complexity,
+                    "mood": profile.mood,
+                    "expected_shape": profile.expected_shape,
+                }
+                brain_state, brain_action = self.brain_state_engine.step_input(prompt, profile=profile_packet)
+                self._active_brain_action = brain_action
+                self._active_brain_context = self.brain_state_engine.build_llm_context(brain_action)
+                brain_meta = {
+                    "intent": getattr(brain_action, "intent", None),
+                    "goal": getattr(brain_action, "goal", None),
+                    "strategy": getattr(brain_action, "response_strategy", None),
+                    "retrieval_strategy": getattr(brain_action, "retrieval_strategy", None),
+                    "confidence": getattr(brain_action, "confidence", None),
+                    "focus_terms": list(getattr(brain_action, "focus_terms", []) or [])[:8],
+                    "update_count": getattr(brain_state, "update_count", None),
+                }
+            except Exception as exc:
+                logger.warning("Brain State input update failed: %s", exc)
+                self._active_brain_action = None
+                self._active_brain_context = ""
+
         enriched = self._enrich_prompt_with_knowledge(prompt)
+        enriched = self._enrich_prompt_with_online_search(enriched, prompt)
         enriched = self._enrich_prompt_with_predictive_modules(enriched, prompt)
-        enriched = self._enrich_prompt_with_search_if_needed(enriched, prompt, profile)
         self.conversation.add_message(
             "user",
             prompt,
@@ -1402,31 +1323,6 @@ class PortableLLM:
             profile,
             has_context=enriched.has_context,
         )
-
-        if response and not enriched.search_context and getattr(self, "search_augmentation", None):
-            post_search_enriched = self._enrich_prompt_with_search_if_needed(
-                enriched,
-                prompt,
-                profile,
-                draft_response=str(response),
-                quality_score=quality.score,
-            )
-            if post_search_enriched.search_context:
-                searched_response, searched_provider, searched_quality, searched_refined = self._generate_best_response(
-                    post_search_enriched.text,
-                    profile,
-                    has_context=post_search_enriched.has_context,
-                )
-                if searched_response and (
-                    quality.score < self._quality_threshold
-                    or searched_quality.score >= quality.score
-                    or _draft_admits_missing_knowledge(str(response))
-                ):
-                    enriched = post_search_enriched
-                    response = searched_response
-                    provider_used = searched_provider
-                    quality = searched_quality
-                    refined = refined or searched_refined
 
         used_offline = False
         if not response and self.offline:
@@ -1443,36 +1339,16 @@ class PortableLLM:
             quality = self._assess_quality(response, profile, has_context=True)
             refined = True
 
-        if response and str(response).strip() and _is_bad_user_visible_response(str(response)):
-            response = _safe_visible_answer(prompt, str(response))
-            provider_used = "safe-fallback"
-            quality = self._assess_quality(response, profile, has_context=False)
-            refined = True
-
-        if response and str(response).strip() and getattr(self, "introspective_learning", None):
+        if response and str(response).strip() and getattr(self, "brain_state_engine", None):
             try:
-                revised_response, critique = self.introspective_learning.analyze_and_correct(
-                    user_prompt=prompt,
+                self.brain_state_engine.update_after_response(
+                    input_text=prompt,
                     response_text=str(response),
-                    rewrite_callback=None,
-                    search_context=enriched.context_preview,
+                    quality_score=int(quality.score),
+                    issues=list(quality.reasons or [])[:4],
                 )
-                introspection_meta = {
-                    "answered_question": getattr(critique, "answered_question", None),
-                    "directness_score": getattr(critique, "directness_score", None),
-                    "relevance_score": getattr(critique, "relevance_score", None),
-                    "completeness_score": getattr(critique, "completeness_score", None),
-                    "leakage_detected": getattr(critique, "leakage_detected", None),
-                    "harmful_scaffolding_detected": getattr(critique, "harmful_scaffolding_detected", None),
-                    "issues": list(getattr(critique, "issues", []) or [])[:6],
-                    "repaired": revised_response.strip() != str(response).strip(),
-                }
-                if revised_response and revised_response.strip() != str(response).strip():
-                    response = revised_response.strip()
-                    refined = True
-                    quality = self._assess_quality(response, profile, has_context=False)
             except Exception as exc:
-                logger.warning("Introspective learning repair failed: %s", exc)
+                logger.warning("Brain State post-response update failed: %s", exc)
 
         if response and str(response).strip():
             model_used = self.model if provider_used == self.provider else self._default_model_for(provider_used)
@@ -1495,10 +1371,7 @@ class PortableLLM:
                     "refined": refined,
                     "offline": used_offline,
                     "grounded_with_ingested_context": enriched.has_context,
-                    "online_search_performed": enriched.search_performed,
-                    "online_search_result_count": enriched.search_result_count,
-                    "online_search_reason": enriched.search_reason,
-                    "introspection": introspection_meta,
+                    "brain_state": brain_meta,
                 },
             )
             self.manager._save_conversation(self.conversation)
@@ -1530,11 +1403,8 @@ class PortableLLM:
                 "complexity": profile.complexity,
                 "grounded_with_ingested_context": enriched.has_context,
                 "context_preview": enriched.context_preview,
-                "online_search_performed": enriched.search_performed,
-                "online_search_result_count": enriched.search_result_count,
-                "online_search_reason": enriched.search_reason,
                 "strict_local_only": self.strict_local_only,
-                "introspection": introspection_meta,
+                "brain_state": brain_meta,
             }
             return response, metadata
 
@@ -1579,8 +1449,7 @@ class PortableLLM:
             "predictive_learning_enabled": bool(self.predictive_memory),
             "echowiring_memory_enabled": bool(self.echowiring_memory),
             "cognitive_functions_enabled": bool(self.cognitive_engine),
-            "search_augmentation_enabled": bool(getattr(self, "search_augmentation", None)),
-            "online_search_enabled": bool(getattr(getattr(self, "search_augmentation", None), "allow_network", False)),
+            "online_search_enabled": bool(self.search_augmentation),
         }
 
     def set_provider(self, provider: str, model: Optional[str] = None) -> bool:
@@ -1604,18 +1473,15 @@ class PortableLLM:
         if self.offline:
             self.offline.close()
 
-    def purge_introspective_traces(self) -> Dict[str, int]:
-        """Purge leaky introspective traces from the local introspection database."""
-        if not getattr(self, "introspective_learning", None):
-            return {"deleted": 0, "reason": "introspective learning module not loaded"}
-        purge = getattr(self.introspective_learning, "purge_leaky_traces", None)
-        if not callable(purge):
-            return {"deleted": 0, "reason": "purge_leaky_traces not available"}
+    def export_brain_state(self) -> Dict[str, object]:
+        """Return the current deterministic brain-state snapshot."""
+        if not getattr(self, "brain_state_engine", None):
+            return {"ok": False, "error": "Brain State module not loaded"}
         try:
-            return purge()
+            return {"ok": True, "state": self.brain_state_engine.export_state()}
         except Exception as exc:
-            logger.warning("Introspective trace purge failed: %s", exc)
-            return {"deleted": 0, "error": str(exc)}
+            logger.warning("Brain State export failed: %s", exc)
+            return {"ok": False, "error": str(exc)}
 
     def ingest_web_content(self, url: str, content: str, title: str = "") -> Dict[str, object]:
         """Ingest webpage content into knowledge store for future conversations."""
@@ -2250,11 +2116,6 @@ class PortableLLM:
 
     def _enrich_prompt_with_predictive_modules(self, enriched: EnrichedPrompt, prompt: str) -> EnrichedPrompt:
         """Inject context from the three Modules/ learning engines when available."""
-        # Do not wrap ordinary general-knowledge/cooking/safety questions in predictive memory.
-        # Otherwise the fallback may answer the wrapper instead of the user's actual question.
-        if _is_general_knowledge_prompt(prompt) and not _is_memory_prompt(prompt):
-            return enriched
-
         module_context = self._build_predictive_module_context(prompt)
         if not module_context:
             return enriched
@@ -2268,6 +2129,55 @@ class PortableLLM:
             f"{enriched.text}"
         )
         preview_parts = [part for part in [enriched.context_preview, module_context[:800].replace("\n", " ").strip()] if part]
+        return EnrichedPrompt(text=enriched_text, has_context=True, context_preview=" | ".join(preview_parts))
+
+    def _enrich_prompt_with_online_search(self, enriched: EnrichedPrompt, prompt: str) -> EnrichedPrompt:
+        """Inject current online search context when local knowledge is missing or the prompt needs freshness."""
+        searcher = getattr(self, "search_augmentation", None)
+        if not searcher:
+            return enriched
+        if _is_small_talk_prompt(prompt) or _is_capability_prompt(prompt):
+            return enriched
+
+        try:
+            decision = searcher.should_search(prompt, local_context=enriched.context_preview)
+        except Exception as exc:
+            logger.warning("Search decision failed: %s", exc)
+            return enriched
+
+        if not getattr(decision, "should_search", False):
+            return enriched
+
+        try:
+            search_context = searcher.search_and_build_context(prompt)
+        except Exception as exc:
+            logger.warning("Online search failed: %s", exc)
+            return enriched
+
+        if not search_context:
+            return enriched
+
+        enriched_text = (
+            "You have online search context for a current or unknown-information request. "
+            "Use it as source leads, not hidden certainty. Do not expose internal predictive/cognitive scaffolding.\n\n"
+            f"Search decision: {getattr(decision, 'reason', 'Online lookup requested')}\n\n"
+            f"{search_context}\n\n"
+            "Output requirements:\n"
+            "1. Answer the user's request directly from the search context when possible.\n"
+            "2. Include an 'Online Search Context Used' section with the concrete source facts used.\n"
+            "3. If the snippets are thin, say what is uncertain and suggest a narrower location/source check.\n"
+            "4. Do not tell the user to ingest sources unless online search returned no usable information.\n\n"
+            "User request:\n"
+            f"{prompt}"
+        )
+        preview_parts = [
+            part
+            for part in [
+                enriched.context_preview,
+                search_context[:1200].replace("\n", " ").strip(),
+            ]
+            if part
+        ]
         return EnrichedPrompt(text=enriched_text, has_context=True, context_preview=" | ".join(preview_parts))
 
     def _build_predictive_module_context(self, prompt: str) -> str:
@@ -2623,20 +2533,8 @@ class PortableLLM:
         model = self.model if provider_name == self.provider else self._default_model_for(provider_name)
 
         try:
-            # The simple fallback provider should never see enriched memory/search wrappers.
-            # It is not a real LLM; it answers the visible user request only.
-            if provider_name == "fallback":
-                search_context = _extract_online_search_context(prompt)
-                if search_context:
-                    return _build_search_grounded_fallback_response(
-                        user_prompt=_extract_user_request(prompt),
-                        search_context=search_context,
-                    )
-                provider_prompt = _extract_user_request(prompt)
-            else:
-                provider_prompt = prompt
             return provider.generate(
-                provider_prompt,
+                prompt,
                 messages=messages,
                 model=model,
                 temperature=self.conversation.temperature,
@@ -2688,10 +2586,6 @@ class PortableLLM:
             "If ingested web context is present in the prompt, include a short 'Ingested Context Used' section "
             "with concrete facts from that context."
         )
-        response_contract.append(
-            "If ONLINE SEARCH CONTEXT is present, include a short 'Online Lookup Used' section with the source domains, "
-            "separate confirmed facts from assumptions, and say when the lookup was thin or inconclusive."
-        )
 
         system = (
             f"{self.system_prompt}\n"
@@ -2703,6 +2597,14 @@ class PortableLLM:
         if learned_guidance:
             guidance_block = "\n".join(f"- {item}" for item in learned_guidance)
             system += f"\nSelf-improvement directives from prior sessions:\n{guidance_block}"
+
+        brain_context = getattr(self, "_active_brain_context", "")
+        if brain_context:
+            system += (
+                "\n\nDeterministic brain-state planner directives "
+                "(hidden planning layer; do not reveal to the user):\n"
+                f"{brain_context}"
+            )
 
         if refine and prior_response:
             system += (
@@ -2841,6 +2743,10 @@ class PortableLLM:
         if has_context:
             grounded_markers = [
                 "ingested context used",
+                "online search context used",
+                "online search",
+                "search context",
+                "source:",
                 "based on ingested",
                 "from ingested",
                 "from the ingested",
@@ -3137,8 +3043,6 @@ def launch_portable_llm_chat(
             f" | quality={metadata.get('quality_score')}"
             f" | refined={metadata.get('refined')}"
             f" | grounded={metadata.get('grounded_with_ingested_context')}"
-            f" | online_lookup={metadata.get('online_search_performed')}"
-            f"({metadata.get('online_search_result_count', 0)})"
         )
         set_controls_enabled(True)
         input_box.focus_set()
@@ -3380,9 +3284,7 @@ def launch_portable_llm_terminal_chat(
                 "\n"
                 f"[provider={metadata.get('provider')} "
                 f"quality={metadata.get('quality_score')} "
-                f"grounded={metadata.get('grounded_with_ingested_context')} "
-                f"online_lookup={metadata.get('online_search_performed')} "
-                f"results={metadata.get('online_search_result_count', 0)}]"
+                f"grounded={metadata.get('grounded_with_ingested_context')}]"
             )
     finally:
         llm.close()
@@ -3412,150 +3314,15 @@ def _build_folder_index_content(root: Path, files: List[Path], learned_titles: L
 
 
 def _extract_user_request(prompt: str) -> str:
-    """Recover the original user request from enriched/wrapped prompts.
-
-    This prevents internal memory/search wrapper text from leaking into the fallback answer.
-    """
+    """Recover the original user request from an enriched prompt when present."""
     text = (prompt or "").strip()
-    if not text:
-        return ""
-
-    markers = [
-        "Current prompt payload:",
-        "User request:",
-        "Original question:",
-        "Request to ground:",
-        "Current user message:",
-        "USER QUESTION:",
-    ]
-    for marker in markers:
-        if marker in text:
-            text = text.rsplit(marker, 1)[1].strip()
-
-    # If a search/memory context was appended after the user request, discard it.
-    hard_stops = [
-        "\n\nONLINE SEARCH CONTEXT",
-        "\n\nPREDICTIVE LEARNING CONTEXT",
-        "\n\nASYNCHRONOUS / ECHOWIRING LEARNING CONTEXT",
-        "\n\nCOGNITIVE FUNCTIONS CONTEXT",
-        "\n\nSearch usage rule:",
-    ]
-    for stop in hard_stops:
-        if stop in text:
-            text = text.split(stop, 1)[0].strip()
-
+    marker = "User request:"
+    if marker in text:
+        return text.rsplit(marker, 1)[1].strip()
+    marker = "Current prompt payload:"
+    if marker in text:
+        return text.rsplit(marker, 1)[1].strip()
     return text
-
-
-def _extract_online_search_context(prompt: str) -> str:
-    """Extract only the online-search block from an enriched prompt."""
-    text = prompt or ""
-    marker = "ONLINE SEARCH CONTEXT"
-    if marker not in text:
-        return ""
-
-    context = text.split(marker, 1)[1]
-    stops = [
-        "\n\nLookup rule:",
-        "\n\nSearch usage rule:",
-        "\n\nPREDICTIVE LEARNING CONTEXT",
-        "\n\nASYNCHRONOUS / ECHOWIRING LEARNING CONTEXT",
-        "\n\nCOGNITIVE FUNCTIONS CONTEXT",
-    ]
-    for stop in stops:
-        if stop in context:
-            context = context.split(stop, 1)[0]
-    return f"{marker}{context}".strip()
-
-
-def _draft_admits_missing_knowledge(response: str) -> bool:
-    """Return True when a draft clearly says it needs outside verification or lacks facts."""
-    lower = (response or "").lower()
-    markers = [
-        "i do not have enough",
-        "not enough learned context",
-        "i don't know",
-        "cannot answer with confidence",
-        "verify it against a primary source",
-        "verify against a primary source",
-        "before treating it as fact",
-        "depends on the timeline",
-        "location may be physical",
-        "context can change the answer",
-        "add trusted sites",
-        "ingest source material",
-    ]
-    return any(marker in lower for marker in markers)
-
-
-def _parse_online_search_results(search_context: str, max_results: int = 5) -> List[Dict[str, str]]:
-    """Parse SearchAugmentation.build_search_context output into compact result dicts."""
-    results: List[Dict[str, str]] = []
-    current: Dict[str, str] = {}
-
-    for raw_line in (search_context or "").splitlines():
-        line = raw_line.rstrip()
-        title_match = re.match(r"^\s*(\d+)\.\s+(.+?)\s*$", line)
-        if title_match:
-            if current:
-                results.append(current)
-            current = {"title": title_match.group(2).strip()}
-            continue
-
-        stripped = line.strip()
-        if stripped.startswith("Source:"):
-            current["source"] = stripped.split(":", 1)[1].strip()
-        elif stripped.startswith("URL:"):
-            current["url"] = stripped.split(":", 1)[1].strip()
-        elif stripped.startswith("Snippet:"):
-            current["snippet"] = stripped.split(":", 1)[1].strip()
-
-    if current:
-        results.append(current)
-
-    return results[:max_results]
-
-
-def _build_search_grounded_fallback_response(user_prompt: str, search_context: str) -> str:
-    """Source-based answer for when only the deterministic fallback provider is available."""
-    results = _parse_online_search_results(search_context)
-    if not results:
-        return (
-            "Online Lookup Attempted:\n"
-            "I tried to look this up, but no usable search results came back. I do not want to invent details.\n\n"
-            "Feedback:\n"
-            "- Ask with a more specific name, date, product, version, location, or source type.\n"
-            "- If this is important, use a model-backed provider such as Ollama so Perseus can synthesize sources more deeply.\n\n"
-            f"Original question: {user_prompt}"
-        )
-
-    source_lines: List[str] = []
-    fact_lines: List[str] = []
-    for result in results:
-        title = result.get("title", "Untitled source")
-        source = result.get("source", "unknown source")
-        url = result.get("url", "")
-        snippet = result.get("snippet", "").strip()
-        domain = urlparse(url).netloc or source.split(" via ", 1)[0]
-        source_lines.append(f"- {title} ({domain})")
-        if snippet:
-            fact_lines.append(f"- {snippet[:360]}")
-
-    if not fact_lines:
-        fact_lines.append("- The lookup returned source links, but the snippets were too thin for a confident factual synthesis.")
-
-    return (
-        "Online Lookup Used:\n"
-        f"I looked this up because the answer may depend on current or external information. Sources checked:\n"
-        f"{chr(10).join(source_lines)}\n\n"
-        "What the retrieved sources suggest:\n"
-        f"{chr(10).join(fact_lines[:5])}\n\n"
-        "Feedback and confidence:\n"
-        "- Treat this as a source-grounded summary of search snippets, not a full model synthesis.\n"
-        "- Strongest next step: verify the key claim against the primary/official source among the links above.\n"
-        "- For a more sophisticated answer with trade-offs, implications, and citations woven into prose, run with Ollama available.\n\n"
-        f"Original question: {user_prompt}"
-    )
 
 
 def _capability_response() -> str:
@@ -3583,6 +3350,71 @@ def _is_capability_prompt(prompt: str) -> bool:
         "what do you do",
     ]
     return any(marker in lower for marker in capability_markers)
+
+
+def _answer_from_online_search_context(prompt: str, user_prompt: str) -> str:
+    """Create a compact source-grounded answer when only the local fallback provider is available."""
+    results = _parse_online_search_results(prompt)
+    if not results:
+        return (
+            "I tried an online lookup, but the search context did not return usable source snippets. "
+            "Try a more specific location, source, or topic so I can look up a narrower answer."
+        )
+
+    weather_like = "weather" in user_prompt.lower() or "forecast" in user_prompt.lower()
+    lead = (
+        f"For `{user_prompt}`, the online lookup found weather-related source snippets. "
+        "Use this as a current snapshot, because weather can change quickly."
+        if weather_like
+        else f"For `{user_prompt}`, the online lookup found relevant source snippets."
+    )
+    bullets = []
+    for item in results[:4]:
+        snippet = item["snippet"][:420].strip()
+        if not snippet:
+            continue
+        bullets.append(f"- {item['title']}: {snippet} (source: {item['source']})")
+
+    if not bullets:
+        return (
+            "I found online results, but their snippets were too thin to answer confidently. "
+            "Try narrowing the request or asking for a specific source."
+        )
+
+    uncertainty = (
+        "- These are search snippets, not a full source read. For weather, check a city or ZIP code for the most accurate local conditions."
+        if weather_like
+        else "- These are search snippets, not a full source read. Verify important details against the primary or official source."
+    )
+
+    return (
+        f"{lead}\n\n"
+        "Online Search Context Used:\n"
+        f"{chr(10).join(bullets)}\n\n"
+        "Uncertainty:\n"
+        f"{uncertainty}"
+    )
+
+
+def _parse_online_search_results(prompt: str) -> List[Dict[str, str]]:
+    """Parse SearchAugmentation's compact context block into title/source/snippet items."""
+    text = prompt or ""
+    pattern = re.compile(
+        r"^\d+\.\s*(?P<title>.*?)\n"
+        r"\s*Source:\s*(?P<source>.*?)\n"
+        r"\s*URL:\s*(?P<url>.*?)\n"
+        r"\s*Retrieved:\s*(?P<retrieved>.*?)\n"
+        r"\s*Snippet:\s*(?P<snippet>.*?)(?=\n\d+\.\s|\nInstruction:|\Z)",
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    results: List[Dict[str, str]] = []
+    for match in pattern.finditer(text):
+        title = re.sub(r"\s+", " ", match.group("title")).strip()
+        source = re.sub(r"\s+", " ", match.group("source")).strip()
+        snippet = re.sub(r"\s+", " ", match.group("snippet")).strip()
+        if title and snippet:
+            results.append({"title": title, "source": source, "snippet": snippet, "url": match.group("url").strip()})
+    return results
 
 
 def _is_memory_prompt(prompt: str) -> bool:
@@ -3691,72 +3523,6 @@ def _context_preview_bullets(context: str, max_bullets: int = 6) -> List[str]:
         if len(bullets) >= max_bullets:
             break
     return bullets
-
-
-def _is_bad_user_visible_response(response: str) -> bool:
-    """Detect internal scaffold/wrapper leakage that should never reach the user."""
-    lower = re.sub(r"\s+", " ", (response or "").lower())
-    bad_markers = [
-        "knowledge response:",
-        "question anatomy for",
-        "current prompt payload:",
-        "predictive learning context",
-        "asynchronous / echowiring",
-        "cognitive functions context",
-        "direct answer: for `",
-        "request to ground:",
-        "you have additional predictive/cognitive learning context",
-    ]
-    return any(marker in lower for marker in bad_markers)
-
-
-
-def _simple_recipe_fallback(prompt: str) -> str:
-    """Direct cooking answers for common fallback cases."""
-    lower = re.sub(r"\s+", " ", _extract_user_request(prompt).lower()).strip(" .!?\t\r\n")
-
-    if "white rice" in lower and any(word in lower for word in ["make", "cook", "prepare", "how to"]):
-        return (
-            "To make white rice, rinse 1 cup of rice until the water runs mostly clear, then add it to a pot with about 2 cups of water and a pinch of salt. "
-            "Bring it to a boil, reduce to low, cover, and simmer for about 15 to 18 minutes. Turn off the heat and let it sit covered for 5 to 10 minutes, then fluff with a fork. "
-            "For firmer rice, use a little less water; for softer rice, use a little more."
-        )
-
-    if "spaghetti" in lower and any(word in lower for word in ["make", "cook", "prepare", "boil", "how to"]):
-        return (
-            "To make spaghetti, bring a large pot of salted water to a boil, add the pasta, and cook until tender but still slightly firm, usually 8 to 12 minutes depending on the package. "
-            "Drain it, then toss it with sauce such as marinara, meat sauce, or garlic and olive oil."
-        )
-
-    return ""
-
-
-def _safe_visible_answer(prompt: str, prior_response: str = "") -> str:
-    """Last-resort user-visible answer that never exposes internal wrappers."""
-    direct = _general_knowledge_fallback(prompt)
-    if direct:
-        return direct
-
-    clean_prompt = _extract_user_request(prompt)
-    lower = re.sub(r"\s+", " ", clean_prompt.lower()).strip(" .!?\t\r\n")
-
-    if _is_small_talk_prompt(clean_prompt):
-        if "how are you" in lower or "how's it going" in lower or "how is it going" in lower:
-            return "I'm doing alright — awake, local, and ready to help. What are we working on?"
-        if "thank" in lower or "thanks" in lower:
-            return "You're welcome."
-        return "Hey — I'm here. What would you like to work on?"
-
-    recipe = _simple_recipe_fallback(clean_prompt)
-    if recipe:
-        return recipe
-
-    heuristic = _heuristic_general_answer(prompt)
-    if heuristic and not _is_bad_user_visible_response(heuristic):
-        return heuristic
-
-    # Do not show the user a meta-answer about context. Give a plain recovery line instead.
-    return "I can help with that. Please ask it again in one sentence and I’ll answer directly."
 
 
 def _format_prediction_packet(label: str, packet: Dict[str, object]) -> str:
@@ -3880,10 +3646,6 @@ def _general_knowledge_fallback(prompt: str) -> str:
     lower = re.sub(r"\s+", " ", text.lower()).strip(" .!?\t\r\n")
     lower = re.sub(r"\bhte\b", "the", lower)
 
-    recipe = _simple_recipe_fallback(lower)
-    if recipe:
-        return recipe
-
     if re.fullmatch(r"is\s+[-+]?\d+(\.\d+)?\s+a\s+number", lower):
         value = re.search(r"[-+]?\d+(\.\d+)?", lower).group(0)
         return (
@@ -3942,38 +3704,6 @@ def _general_knowledge_fallback(prompt: str) -> str:
             "In everyday language, yes, water is wet. More precisely, water makes other materials wet by adhering "
             "to their surfaces and forming a liquid film. So the casual answer is yes; the technical answer is that "
             "wetness describes the interaction between a liquid and a surface."
-        )
-
-    if ("how hot" in lower or "what temperature" in lower or "temperature" in lower) and "water" in lower and "boil" in lower:
-        return (
-            "Water boils at about 100°C or 212°F at sea level under normal air pressure. "
-            "At higher altitudes it boils at a lower temperature because air pressure is lower; under higher pressure, "
-            "like in a pressure cooker, it boils at a higher temperature."
-        )
-
-    if ("how deep" in lower and "ocean" in lower) or lower in {"how deep is the ocean", "how deep are the oceans"}:
-        return (
-            "The ocean is about 3.7 kilometers deep on average, roughly 12,100 feet. "
-            "The deepest known point is Challenger Deep in the Mariana Trench, about 10.9 to 11 kilometers deep, "
-            "or around 36,000 feet."
-        )
-
-    if ("how to make spaghetti" in lower or "make spaghetti" in lower or "cook spaghetti" in lower):
-        return (
-            "To make spaghetti: bring a large pot of salted water to a boil, add the spaghetti, and cook until tender "
-            "but still slightly firm, usually about 8 to 12 minutes depending on the package. While it cooks, warm a sauce "
-            "in a pan. Drain the pasta, save a little pasta water, then toss the spaghetti with the sauce. Add a splash of "
-            "pasta water if the sauce needs loosening, then finish with cheese, herbs, or olive oil if you like."
-        )
-
-    if (("fall" in lower or "fell" in lower) and re.search(r"\b10\s*(feet|foot|ft)\b", lower)):
-        return (
-            "A 10-foot fall can range from minor bruising to serious injury depending on how you land, your age/health, "
-            "and the surface. Ankles, wrists, knees, ribs, back, neck, and head are common concern areas. "
-            "Seek urgent medical care now if you hit your head, lost consciousness, have neck/back pain, numbness, weakness, "
-            "trouble breathing, severe swelling, deformity, heavy bleeding, confusion, vomiting, or cannot walk/bear weight. "
-            "If symptoms are mild, rest, avoid stressing the injured area, use ice wrapped in cloth, and monitor closely; "
-            "worsening pain or neurological symptoms should be checked immediately."
         )
 
     return ""
