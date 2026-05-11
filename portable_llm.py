@@ -841,6 +841,10 @@ class EnrichedPrompt:
     text: str
     has_context: bool
     context_preview: str = ""
+    search_performed: bool = False
+    search_context: str = ""
+    search_reason: str = ""
+    search_result_count: int = 0
 
 
 class SelfImprovementStore:
@@ -1123,30 +1127,61 @@ class PortableLLM:
         enriched: EnrichedPrompt,
         prompt: str,
         profile: PromptProfile,
+        draft_response: str = "",
+        quality_score: Optional[int] = None,
+        force: bool = False,
     ) -> EnrichedPrompt:
-        """Look up information every time when enabled, but keep lookup context hidden.
+        """Look up online information when the request or draft warrants it.
 
-        Search context is added only for model-backed providers. The fallback provider
-        gets the original prompt so it does not regurgitate snippets or wrapper text.
+        Model-backed providers receive compact lookup context. The deterministic
+        fallback path gets a purpose-built search summary instead of raw wrappers.
         """
         if not getattr(self, "search_augmentation", None):
             return enriched
         if not getattr(self.search_augmentation, "allow_network", False):
             return enriched
 
+        decision = self.search_augmentation.should_search(
+            prompt=prompt,
+            local_context=enriched.context_preview,
+            draft_response=draft_response,
+            quality_score=quality_score,
+        )
+        if not force and not decision.should_search:
+            return EnrichedPrompt(
+                text=enriched.text,
+                has_context=enriched.has_context,
+                context_preview=enriched.context_preview,
+                search_performed=False,
+                search_context=enriched.search_context,
+                search_reason=decision.reason,
+                search_result_count=enriched.search_result_count,
+            )
+
         try:
-            search_context = self.search_augmentation.search_and_build_context(prompt)
+            results = self.search_augmentation.search(prompt)
+            search_context = self.search_augmentation.build_search_context(prompt, results)
         except Exception as exc:
             logger.warning("Search augmentation failed: %s", exc)
             return enriched
 
         if not search_context.strip():
-            return enriched
+            return EnrichedPrompt(
+                text=enriched.text,
+                has_context=enriched.has_context,
+                context_preview=enriched.context_preview,
+                search_performed=True,
+                search_context="",
+                search_reason=decision.reason,
+                search_result_count=0,
+            )
 
         merged_text = (
             f"{enriched.text}\n\n"
             f"{search_context}\n\n"
-            "Lookup rule: Use search as supporting evidence. Do not quote irrelevant snippets. "
+            "Lookup rule: Use search as supporting evidence. Include a short 'Online Lookup Used' "
+            "section with the source domains when the lookup materially affects the answer. "
+            "Do not quote irrelevant snippets. "
             "Answer the user's actual question directly and naturally. "
             "Never expose internal context labels to the user."
         )
@@ -1155,6 +1190,10 @@ class PortableLLM:
             text=merged_text,
             has_context=enriched.has_context,  # search alone must not trigger grounded rescue
             context_preview=preview[:MAX_KNOWLEDGE_CONTEXT_CHARS],
+            search_performed=True,
+            search_context=search_context,
+            search_reason=decision.reason,
+            search_result_count=len(results),
         )
 
     @staticmethod
@@ -1364,6 +1403,31 @@ class PortableLLM:
             has_context=enriched.has_context,
         )
 
+        if response and not enriched.search_context and getattr(self, "search_augmentation", None):
+            post_search_enriched = self._enrich_prompt_with_search_if_needed(
+                enriched,
+                prompt,
+                profile,
+                draft_response=str(response),
+                quality_score=quality.score,
+            )
+            if post_search_enriched.search_context:
+                searched_response, searched_provider, searched_quality, searched_refined = self._generate_best_response(
+                    post_search_enriched.text,
+                    profile,
+                    has_context=post_search_enriched.has_context,
+                )
+                if searched_response and (
+                    quality.score < self._quality_threshold
+                    or searched_quality.score >= quality.score
+                    or _draft_admits_missing_knowledge(str(response))
+                ):
+                    enriched = post_search_enriched
+                    response = searched_response
+                    provider_used = searched_provider
+                    quality = searched_quality
+                    refined = refined or searched_refined
+
         used_offline = False
         if not response and self.offline:
             used_offline = True
@@ -1431,6 +1495,9 @@ class PortableLLM:
                     "refined": refined,
                     "offline": used_offline,
                     "grounded_with_ingested_context": enriched.has_context,
+                    "online_search_performed": enriched.search_performed,
+                    "online_search_result_count": enriched.search_result_count,
+                    "online_search_reason": enriched.search_reason,
                     "introspection": introspection_meta,
                 },
             )
@@ -1463,6 +1530,9 @@ class PortableLLM:
                 "complexity": profile.complexity,
                 "grounded_with_ingested_context": enriched.has_context,
                 "context_preview": enriched.context_preview,
+                "online_search_performed": enriched.search_performed,
+                "online_search_result_count": enriched.search_result_count,
+                "online_search_reason": enriched.search_reason,
                 "strict_local_only": self.strict_local_only,
                 "introspection": introspection_meta,
             }
@@ -2555,7 +2625,16 @@ class PortableLLM:
         try:
             # The simple fallback provider should never see enriched memory/search wrappers.
             # It is not a real LLM; it answers the visible user request only.
-            provider_prompt = _extract_user_request(prompt) if provider_name == "fallback" else prompt
+            if provider_name == "fallback":
+                search_context = _extract_online_search_context(prompt)
+                if search_context:
+                    return _build_search_grounded_fallback_response(
+                        user_prompt=_extract_user_request(prompt),
+                        search_context=search_context,
+                    )
+                provider_prompt = _extract_user_request(prompt)
+            else:
+                provider_prompt = prompt
             return provider.generate(
                 provider_prompt,
                 messages=messages,
@@ -2608,6 +2687,10 @@ class PortableLLM:
         response_contract.append(
             "If ingested web context is present in the prompt, include a short 'Ingested Context Used' section "
             "with concrete facts from that context."
+        )
+        response_contract.append(
+            "If ONLINE SEARCH CONTEXT is present, include a short 'Online Lookup Used' section with the source domains, "
+            "separate confirmed facts from assumptions, and say when the lookup was thin or inconclusive."
         )
 
         system = (
@@ -3054,6 +3137,8 @@ def launch_portable_llm_chat(
             f" | quality={metadata.get('quality_score')}"
             f" | refined={metadata.get('refined')}"
             f" | grounded={metadata.get('grounded_with_ingested_context')}"
+            f" | online_lookup={metadata.get('online_search_performed')}"
+            f"({metadata.get('online_search_result_count', 0)})"
         )
         set_controls_enabled(True)
         input_box.focus_set()
@@ -3295,7 +3380,9 @@ def launch_portable_llm_terminal_chat(
                 "\n"
                 f"[provider={metadata.get('provider')} "
                 f"quality={metadata.get('quality_score')} "
-                f"grounded={metadata.get('grounded_with_ingested_context')}]"
+                f"grounded={metadata.get('grounded_with_ingested_context')} "
+                f"online_lookup={metadata.get('online_search_performed')} "
+                f"results={metadata.get('online_search_result_count', 0)}]"
             )
     finally:
         llm.close()
@@ -3358,6 +3445,117 @@ def _extract_user_request(prompt: str) -> str:
             text = text.split(stop, 1)[0].strip()
 
     return text
+
+
+def _extract_online_search_context(prompt: str) -> str:
+    """Extract only the online-search block from an enriched prompt."""
+    text = prompt or ""
+    marker = "ONLINE SEARCH CONTEXT"
+    if marker not in text:
+        return ""
+
+    context = text.split(marker, 1)[1]
+    stops = [
+        "\n\nLookup rule:",
+        "\n\nSearch usage rule:",
+        "\n\nPREDICTIVE LEARNING CONTEXT",
+        "\n\nASYNCHRONOUS / ECHOWIRING LEARNING CONTEXT",
+        "\n\nCOGNITIVE FUNCTIONS CONTEXT",
+    ]
+    for stop in stops:
+        if stop in context:
+            context = context.split(stop, 1)[0]
+    return f"{marker}{context}".strip()
+
+
+def _draft_admits_missing_knowledge(response: str) -> bool:
+    """Return True when a draft clearly says it needs outside verification or lacks facts."""
+    lower = (response or "").lower()
+    markers = [
+        "i do not have enough",
+        "not enough learned context",
+        "i don't know",
+        "cannot answer with confidence",
+        "verify it against a primary source",
+        "verify against a primary source",
+        "before treating it as fact",
+        "depends on the timeline",
+        "location may be physical",
+        "context can change the answer",
+        "add trusted sites",
+        "ingest source material",
+    ]
+    return any(marker in lower for marker in markers)
+
+
+def _parse_online_search_results(search_context: str, max_results: int = 5) -> List[Dict[str, str]]:
+    """Parse SearchAugmentation.build_search_context output into compact result dicts."""
+    results: List[Dict[str, str]] = []
+    current: Dict[str, str] = {}
+
+    for raw_line in (search_context or "").splitlines():
+        line = raw_line.rstrip()
+        title_match = re.match(r"^\s*(\d+)\.\s+(.+?)\s*$", line)
+        if title_match:
+            if current:
+                results.append(current)
+            current = {"title": title_match.group(2).strip()}
+            continue
+
+        stripped = line.strip()
+        if stripped.startswith("Source:"):
+            current["source"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("URL:"):
+            current["url"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Snippet:"):
+            current["snippet"] = stripped.split(":", 1)[1].strip()
+
+    if current:
+        results.append(current)
+
+    return results[:max_results]
+
+
+def _build_search_grounded_fallback_response(user_prompt: str, search_context: str) -> str:
+    """Source-based answer for when only the deterministic fallback provider is available."""
+    results = _parse_online_search_results(search_context)
+    if not results:
+        return (
+            "Online Lookup Attempted:\n"
+            "I tried to look this up, but no usable search results came back. I do not want to invent details.\n\n"
+            "Feedback:\n"
+            "- Ask with a more specific name, date, product, version, location, or source type.\n"
+            "- If this is important, use a model-backed provider such as Ollama so Perseus can synthesize sources more deeply.\n\n"
+            f"Original question: {user_prompt}"
+        )
+
+    source_lines: List[str] = []
+    fact_lines: List[str] = []
+    for result in results:
+        title = result.get("title", "Untitled source")
+        source = result.get("source", "unknown source")
+        url = result.get("url", "")
+        snippet = result.get("snippet", "").strip()
+        domain = urlparse(url).netloc or source.split(" via ", 1)[0]
+        source_lines.append(f"- {title} ({domain})")
+        if snippet:
+            fact_lines.append(f"- {snippet[:360]}")
+
+    if not fact_lines:
+        fact_lines.append("- The lookup returned source links, but the snippets were too thin for a confident factual synthesis.")
+
+    return (
+        "Online Lookup Used:\n"
+        f"I looked this up because the answer may depend on current or external information. Sources checked:\n"
+        f"{chr(10).join(source_lines)}\n\n"
+        "What the retrieved sources suggest:\n"
+        f"{chr(10).join(fact_lines[:5])}\n\n"
+        "Feedback and confidence:\n"
+        "- Treat this as a source-grounded summary of search snippets, not a full model synthesis.\n"
+        "- Strongest next step: verify the key claim against the primary/official source among the links above.\n"
+        "- For a more sophisticated answer with trade-offs, implications, and citations woven into prose, run with Ollama available.\n\n"
+        f"Original question: {user_prompt}"
+    )
 
 
 def _capability_response() -> str:

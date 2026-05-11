@@ -14,7 +14,7 @@ Network providers:
 - Wikipedia summary fallback for broad stable topics.
 - DuckDuckGo HTML fallback as last resort.
 
-Set PortableLLM(strict_local_only=False) to allow this module to use network access.
+Pass allow_online_search=True (the default) to allow this module to use network access.
 """
 
 from __future__ import annotations
@@ -149,6 +149,7 @@ class SearchAugmentation:
         explicit_terms = [
             "search the web",
             "look up",
+            "lookup",
             "google",
             "browse",
             "latest",
@@ -163,6 +164,12 @@ class SearchAugmentation:
             "stock",
             "update",
             "verify online",
+            "check online",
+            "source this",
+            "fact check",
+            "fact-check",
+            "as of",
+            "near me",
         ]
         if any(term in prompt_lower for term in explicit_terms):
             return SearchDecision(True, "User explicitly requested current or online information.", 0.95)
@@ -184,9 +191,21 @@ class SearchAugmentation:
             "war",
             "sports",
             "forecast",
+            "available",
+            "availability",
+            "ranking",
+            "winner",
+            "won",
+            "results",
+            "deadline",
+            "requirements",
+            "api changes",
         ]
         if any(term in prompt_lower for term in current_sensitive_terms):
             return SearchDecision(True, "Question may depend on current information.", 0.8)
+
+        if re.search(r"\b20(?:2[4-9]|3\d)\b", prompt_lower):
+            return SearchDecision(True, "Question includes a recent or future year.", 0.78)
 
         if quality_score is not None and quality_score < 60:
             return SearchDecision(True, "Draft quality score is low.", 0.75)
@@ -196,6 +215,11 @@ class SearchAugmentation:
             "not enough learned context",
             "i don't know",
             "cannot answer with confidence",
+            "verify it against a primary source",
+            "verify against a primary source",
+            "before treating it as fact",
+            "depends on the timeline",
+            "context can change the answer",
             "add trusted sites",
             "ingest source material",
         ]
