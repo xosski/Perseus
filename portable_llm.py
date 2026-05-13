@@ -131,6 +131,9 @@ except ImportError:
             if "ONLINE SEARCH CONTEXT" in (prompt or ""):
                 return _answer_from_online_search_context(prompt, user_prompt)
 
+            if "Ingested context:" in (prompt or ""):
+                return _answer_from_ingested_context(prompt, user_prompt)
+
             general_answer = _general_knowledge_fallback(user_prompt)
             if general_answer:
                 return general_answer
@@ -344,32 +347,133 @@ except ImportError:
             return {"total_items_learned": 1, "title": title, "chars": len(text)}
 
         def get_knowledge_context_for_query(self, query: str, limit: int = 3) -> str:
-            terms = [term.lower() for term in re.findall(r"[a-zA-Z0-9_-]{3,}", query or "")[:8]]
+            terms = self._query_terms(query)
             if not terms:
                 return ""
 
             rows = self.conn.execute(
                 """
-                SELECT title, content
+                SELECT id, url, title, content, updated_at
                 FROM learned_documents
                 ORDER BY updated_at DESC, id DESC
-                LIMIT 200
                 """
             ).fetchall()
 
             scored: List[Tuple[int, sqlite3.Row]] = []
             for row in rows:
-                haystack = f"{row['title']}\n{row['content']}".lower()
-                score = sum(haystack.count(term) for term in terms)
+                score = self._score_knowledge_row(row=row, terms=terms, query=query)
                 if score > 0:
                     scored.append((score, row))
 
             snippets: List[str] = []
-            for _score, row in sorted(scored, key=lambda item: item[0], reverse=True)[:limit]:
-                content = re.sub(r"\s+", " ", row["content"]).strip()[:900]
-                snippets.append(f"Source: {row['title']}\n{content}")
+            for _score, row in sorted(scored, key=lambda item: (item[0], item[1]["updated_at"] or ""), reverse=True)[:limit]:
+                excerpt = self._context_excerpt(row["content"], terms=terms)
+                source = row["title"] or row["url"] or "learned document"
+                snippets.append(f"Source: {source}\n{excerpt}")
 
             return "\n\n".join(snippets)
+
+        @staticmethod
+        def _query_terms(query: str) -> List[str]:
+            """Extract lookup terms that work for prose, paths, package names, and code symbols."""
+            raw_tokens = re.findall(r"[a-zA-Z0-9_./\\-]{3,}", query or "")
+            stop = {
+                "about",
+                "after",
+                "answer",
+                "before",
+                "content",
+                "explain",
+                "from",
+                "ingested",
+                "learned",
+                "logic",
+                "please",
+                "show",
+                "tell",
+                "that",
+                "the",
+                "this",
+                "what",
+                "where",
+                "with",
+            }
+
+            terms: List[str] = []
+            seen = set()
+            for token in raw_tokens:
+                candidates = [token]
+                candidates.extend(part for part in re.split(r"[./\\\-_]+", token) if part)
+                for candidate in candidates:
+                    normalized = candidate.lower().strip(" .\\/-_")
+                    if len(normalized) < 3 or normalized in stop or normalized in seen:
+                        continue
+                    seen.add(normalized)
+                    terms.append(normalized)
+            return terms[:16]
+
+        @staticmethod
+        def _score_knowledge_row(row: sqlite3.Row, terms: List[str], query: str) -> int:
+            title = str(row["title"] or "").lower()
+            url = str(row["url"] or "").lower()
+            content = str(row["content"] or "").lower()
+            score = 0
+
+            query_phrase = re.sub(r"\s+", " ", (query or "").lower()).strip()
+            combined_title = f"{title} {url}"
+            if query_phrase and len(query_phrase) <= 120:
+                if query_phrase in combined_title:
+                    score += 80
+                if query_phrase in content:
+                    score += 35
+
+            for term in terms:
+                title_hits = WebKnowledgeLearner._term_count(combined_title, term)
+                content_hits = WebKnowledgeLearner._term_count(content, term)
+                if title_hits:
+                    score += title_hits * 12
+                if content_hits:
+                    score += min(content_hits, 20)
+
+            if title.endswith("/_folder_index") and not any(
+                marker in query_phrase for marker in ["index", "inventory", "list", "overview", "structure", "what files"]
+            ):
+                score = score // 3
+
+            return score
+
+        @staticmethod
+        def _term_count(text: str, term: str) -> int:
+            if not text or not term:
+                return 0
+            pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
+            return len(re.findall(pattern, text))
+
+        @staticmethod
+        def _context_excerpt(content: str, terms: List[str], max_chars: int = 1200) -> str:
+            text = str(content or "")
+            if not text:
+                return ""
+
+            lower = text.lower()
+            positions = [lower.find(term) for term in terms if term and lower.find(term) >= 0]
+            if positions:
+                focus = min(positions)
+                start = max(0, focus - 350)
+                end = min(len(text), focus + max_chars - 120)
+                excerpt = text[start:end]
+                prefix = "... " if start > 0 else ""
+                suffix = " ..." if end < len(text) else ""
+            else:
+                excerpt = text[:max_chars]
+                prefix = ""
+                suffix = " ..." if len(text) > max_chars else ""
+
+            excerpt = re.sub(r"\s+", " ", excerpt).strip()
+            if len(excerpt) > max_chars:
+                excerpt = excerpt[:max_chars].rsplit(" ", 1)[0].strip()
+                suffix = " ..."
+            return f"{prefix}{excerpt}{suffix}".strip()
 
         def get_all_knowledge_context(self, limit: int = 8) -> str:
             rows = self.conn.execute(
@@ -1822,6 +1926,7 @@ class PortableLLM:
             for ext in (extensions or list(SUPPORTED_KNOWLEDGE_EXTENSIONS))
         }
         files = sorted(root.rglob("*") if recursive else root.glob("*"))
+        folder_label = _knowledge_folder_label(root)
 
         results: List[Dict[str, object]] = []
         learned_titles: List[str] = []
@@ -1868,7 +1973,7 @@ class PortableLLM:
             except ValueError:
                 relative_title = path.name
 
-            title = f"{root.name}/{relative_title}"
+            title = f"{folder_label}/{relative_title}"
 
             ingest = self.ingest_web_content(url=path.resolve().as_uri(), content=content, title=title)
             ingest["path"] = str(path)
@@ -1880,13 +1985,14 @@ class PortableLLM:
 
         if successes > 0:
             index_content = _build_folder_index_content(root=root, files=files, learned_titles=learned_titles)
+            index_title = f"{folder_label}/_folder_index"
             index_ingest = self.ingest_web_content(
-                url=f"perseus://folder-index/{root.name}",
+                url=f"perseus://folder-index/{_safe_knowledge_id(folder_label)}",
                 content=index_content,
-                title=f"{root.name}/_folder_index",
+                title=index_title,
             )
             index_ingest["path"] = str(root)
-            index_ingest["title"] = f"{root.name}/_folder_index"
+            index_ingest["title"] = index_title
             results.append(index_ingest)
 
         return {
@@ -2097,13 +2203,13 @@ class PortableLLM:
         enriched_text = (
             "You have retrieved ingested web knowledge relevant to this query. "
             "Ground your answer in that ingested context, including learned user chat memory when relevant, "
-            "and be explicit when you do.\n\n"
+            "and be explicit when you do. Use the context as internal evidence; do not paste raw retrieved excerpts.\n\n"
             "Ingested context:\n"
             f"{context}\n\n"
             "Output requirements:\n"
             "1. Start with a realistic summary of what is currently known.\n"
             "2. Review all retrieved ingested context blocks, synthesize every relevant non-duplicate point, "
-            "and include an 'Ingested Context Used' section with concrete points.\n"
+            "and include an 'Ingested Context Used' section with paraphrased concrete points, not raw context dumps.\n"
             "3. Include uncertainty where evidence is incomplete.\n"
             "4. Use learned user preferences, prior chat facts, and project context when they are relevant.\n"
             "5. Provide educational explanation and practical implications.\n"
@@ -2159,14 +2265,16 @@ class PortableLLM:
 
         enriched_text = (
             "You have online search context for a current or unknown-information request. "
-            "Use it as source leads, not hidden certainty. Do not expose internal predictive/cognitive scaffolding.\n\n"
+            "Use it as internal evidence to analyze the request, not as text to display. "
+            "Do not expose internal predictive/cognitive scaffolding, lookup payloads, context blocks, or raw snippets.\n\n"
             f"Search decision: {getattr(decision, 'reason', 'Online lookup requested')}\n\n"
             f"{search_context}\n\n"
             "Output requirements:\n"
             "1. Answer the user's request directly from the search context when possible.\n"
-            "2. Include an 'Online Search Context Used' section with the concrete source facts used.\n"
-            "3. If the snippets are thin, say what is uncertain and suggest a narrower location/source check.\n"
-            "4. Do not tell the user to ingest sources unless online search returned no usable information.\n\n"
+            "2. Synthesize and paraphrase; do not quote or paste source snippets/context verbatim.\n"
+            "3. Include a short 'Sources consulted' note with domains or provider names only when useful.\n"
+            "4. If the snippets are thin, say what is uncertain and suggest a narrower location/source check.\n"
+            "5. Do not tell the user to ingest sources unless online search returned no usable information.\n\n"
             "User request:\n"
             f"{prompt}"
         )
@@ -2359,15 +2467,26 @@ class PortableLLM:
         quoted_phrases = re.findall(r"['\"]([^'\"]{3,80})['\"]", prompt)
         queries.extend(phrase.strip() for phrase in quoted_phrases if phrase.strip())
 
-        tokens = re.findall(r"[a-zA-Z]{4,}", lower)
-        stop = MEMORY_RETRIEVAL_STOPWORDS | {"explain", "summarize"}
+        tokens = re.findall(r"[a-zA-Z]{3,}", lower)
+        stop = MEMORY_RETRIEVAL_STOPWORDS | {
+            "content",
+            "explain",
+            "folder",
+            "ingested",
+            "learned",
+            "module",
+            "modules",
+            "project",
+            "summarize",
+        }
         keywords = [t for t in tokens if t not in stop]
-        queries.extend(keywords[:6])
 
         if len(keywords) >= 2:
-            queries.append(f"{keywords[0]} {keywords[1]}")
+            queries.append(" ".join(keywords[: min(6, len(keywords))]))
         if len(keywords) >= 3:
             queries.append(" ".join(keywords[:3]))
+            queries.append(" ".join(keywords[-3:]))
+        queries.extend(keywords[:6])
 
         queries.append(prompt)
         deduped: List[str] = []
@@ -2646,14 +2765,17 @@ class PortableLLM:
         reasons: List[str] = []
 
         generic_markers = [
+            "add trusted sites",
             "i don't have specific knowledge",
             "i don't remember",
             "i do not remember",
+            "i do not have enough learned context",
             "i have no memory",
             "as an ai language model",
             "cannot provide",
             "i'm unable to",
             "i do not have access",
+            "knowledge response:",
         ]
         filler_markers = [
             "great question",
@@ -3290,6 +3412,23 @@ def launch_portable_llm_terminal_chat(
         llm.close()
 
 
+def _knowledge_folder_label(root: Path) -> str:
+    """Create a stable learned-source label that keeps important parent folders."""
+    parts = [part for part in root.parts if part]
+    lowered = [part.lower() for part in parts]
+    for marker in ("princess protocol", "snap logic", "snap-master"):
+        if marker in lowered:
+            start = lowered.index(marker)
+            return "/".join(parts[start:])
+    return root.name
+
+
+def _safe_knowledge_id(label: str) -> str:
+    """Create a compact identifier for synthetic folder-index URLs."""
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "-", label or "folder").strip("-._")
+    return safe or "folder"
+
+
 def _build_folder_index_content(root: Path, files: List[Path], learned_titles: List[str]) -> str:
     """Create a searchable index so folder-level concepts retrieve all learned local files."""
     extension_counts: Dict[str, int] = {}
@@ -3303,9 +3442,24 @@ def _build_folder_index_content(root: Path, files: List[Path], learned_titles: L
     extension_list = "\n".join(
         f"- {extension}: {count}" for extension, count in sorted(extension_counts.items())
     )
+    path_parts = [part for part in root.parts if part]
+    folder_aliases = sorted(
+        {
+            root.name,
+            root.as_posix(),
+            str(root),
+            *path_parts[-6:],
+            " ".join(path_parts[-4:]),
+        }
+    )
+    alias_list = "\n".join(f"- {alias}" for alias in folder_aliases if alias)
+    folder_label = _knowledge_folder_label(root)
     return (
-        f"Folder knowledge index for {root.name}.\n"
-        f"This folder is part of the local Perseus learning base and should be considered for relevant answers.\n\n"
+        f"Folder knowledge index for {folder_label}.\n"
+        f"This folder is part of the local Perseus learning base and should be considered for relevant answers.\n"
+        f"Absolute path: {root}\n\n"
+        "Folder aliases / path terms:\n"
+        f"{alias_list}\n\n"
         "File type inventory:\n"
         f"{extension_list}\n\n"
         "Learned files:\n"
@@ -3352,6 +3506,131 @@ def _is_capability_prompt(prompt: str) -> bool:
     return any(marker in lower for marker in capability_markers)
 
 
+def _answer_from_ingested_context(prompt: str, user_prompt: str) -> str:
+    """Create a grounded fallback answer from retrieved learned context without dumping raw context."""
+    sources = _parse_ingested_context_sources(prompt)
+    if not sources:
+        return (
+            "I found an ingested-context prompt, but the context block was empty or unreadable. "
+            "Re-ingest the folder or ask with more specific file/module names."
+        )
+
+    points = _synthesize_ingested_points(sources, user_prompt)
+    if not points:
+        return (
+            "I found ingested sources, but I could not extract a confident answer from the retrieved excerpts. "
+            "Ask for a narrower file, function, or module name so I can retrieve a tighter slice."
+        )
+
+    used_titles = re.findall(r"`([^`]+)`:", "\n".join(points))
+    source_note = ", ".join(used_titles[:4] or [source["title"] for source in sources[:1]])
+    return (
+        "Answer based on ingested content:\n"
+        f"{chr(10).join(f'- {point}' for point in points)}\n\n"
+        f"Sources consulted: {source_note}.\n\n"
+        "Next steps:\n"
+        "- Ask about a specific file/function if you want a deeper code walkthrough.\n"
+        "- Re-run folder ingest after changing SNAP files so the learned store stays current."
+    )
+
+
+def _parse_ingested_context_sources(prompt: str) -> List[Dict[str, str]]:
+    context_match = re.search(
+        r"Ingested context:\n(?P<context>.*?)(?:\n\nOutput requirements:|\Z)",
+        prompt or "",
+        flags=re.DOTALL,
+    )
+    if not context_match:
+        return []
+
+    context = context_match.group("context").strip()
+    pattern = re.compile(
+        r"Source:\s*(?P<title>.*?)\n(?P<content>.*?)(?=\n\nSource:\s|\Z)",
+        flags=re.DOTALL,
+    )
+    sources: List[Dict[str, str]] = []
+    for match in pattern.finditer(context):
+        title = re.sub(r"\s+", " ", match.group("title")).strip()
+        content = re.sub(r"\s+", " ", match.group("content")).strip()
+        if title and content:
+            sources.append({"title": title, "content": content})
+    return sources
+
+
+def _synthesize_ingested_points(sources: List[Dict[str, str]], user_prompt: str, max_points: int = 4) -> List[str]:
+    query_terms = {
+        token
+        for token in re.findall(r"[a-z0-9_]+", (user_prompt or "").lower())
+        if len(token) > 3 and token not in {"from", "ingested", "folder", "what", "where", "which", "module"}
+    }
+    path_context_terms = {"ghostiso", "master", "perseus", "princess", "protocol", "snap", "wrap"}
+    ranking_terms = query_terms.difference(path_context_terms) or query_terms
+
+    ranked_sources = sorted(
+        sources,
+        key=lambda source: _ingested_source_score(source, ranking_terms),
+        reverse=True,
+    )
+    points: List[str] = []
+    seen = set()
+
+    for source in ranked_sources[:8]:
+        if ranking_terms and _ingested_source_score(source, ranking_terms) <= 0:
+            continue
+        title = source["title"]
+        content = source["content"]
+        function_points = _function_points_from_context(content)
+        candidates = function_points or _sentence_points_from_context(content, ranking_terms)
+
+        for candidate in candidates:
+            point = _shorten_lookup_point(candidate, max_chars=260)
+            if not point:
+                continue
+            key = re.sub(r"\W+", "", f"{title} {point}".lower())[:160]
+            if key in seen:
+                continue
+            seen.add(key)
+            points.append(f"`{title}`: {point}")
+            break
+
+        if len(points) >= max_points:
+            break
+    return points
+
+
+def _ingested_source_score(source: Dict[str, str], query_terms: set) -> int:
+    haystack = f"{source.get('title', '')}\n{source.get('content', '')}".lower()
+    return sum(len(re.findall(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", haystack)) for term in query_terms)
+
+
+def _function_points_from_context(content: str) -> List[str]:
+    points: List[str] = []
+    pattern = re.compile(
+        r"def\s+(?P<name>[a-zA-Z_][a-zA-Z0-9_]*)\s*\((?P<args>[^)]*)\):\s*(?:[rubfRUBF]*[\"']{3}(?P<doc>.*?)[\"']{3})?",
+        flags=re.DOTALL,
+    )
+    for match in pattern.finditer(content or ""):
+        name = match.group("name")
+        args = re.sub(r"\s+", " ", match.group("args")).strip()
+        doc = re.sub(r"\s+", " ", match.group("doc") or "").strip()
+        if doc:
+            first_sentence = re.split(r"(?<=[.!?])\s+", doc)[0]
+            points.append(f"defines `{name}({args})`; {first_sentence}")
+        else:
+            points.append(f"defines `{name}({args})` for the behavior shown in the retrieved source excerpt")
+    return points
+
+
+def _sentence_points_from_context(content: str, query_terms: set) -> List[str]:
+    sentences = [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", content or "") if len(sentence.strip()) >= 35]
+    ranked = sorted(
+        sentences,
+        key=lambda sentence: len(query_terms.intersection(set(re.findall(r"[a-z0-9_]+", sentence.lower())))),
+        reverse=True,
+    )
+    return ranked[:2]
+
+
 def _answer_from_online_search_context(prompt: str, user_prompt: str) -> str:
     """Create a compact source-grounded answer when only the local fallback provider is available."""
     results = _parse_online_search_results(prompt)
@@ -3362,38 +3641,134 @@ def _answer_from_online_search_context(prompt: str, user_prompt: str) -> str:
         )
 
     weather_like = "weather" in user_prompt.lower() or "forecast" in user_prompt.lower()
-    lead = (
-        f"For `{user_prompt}`, the online lookup found weather-related source snippets. "
-        "Use this as a current snapshot, because weather can change quickly."
-        if weather_like
-        else f"For `{user_prompt}`, the online lookup found relevant source snippets."
-    )
-    bullets = []
-    for item in results[:4]:
-        snippet = item["snippet"][:420].strip()
-        if not snippet:
-            continue
-        bullets.append(f"- {item['title']}: {snippet} (source: {item['source']})")
+    if weather_like:
+        weather_answer = _synthesize_weather_lookup(results, user_prompt)
+        if weather_answer:
+            return weather_answer
 
-    if not bullets:
+    synthesized_points = _synthesize_lookup_points(results, user_prompt)
+    if not synthesized_points:
         return (
             "I found online results, but their snippets were too thin to answer confidently. "
             "Try narrowing the request or asking for a specific source."
         )
 
-    uncertainty = (
-        "- These are search snippets, not a full source read. For weather, check a city or ZIP code for the most accurate local conditions."
-        if weather_like
-        else "- These are search snippets, not a full source read. Verify important details against the primary or official source."
-    )
+    source_note = _format_source_note(results)
 
     return (
-        f"{lead}\n\n"
-        "Online Search Context Used:\n"
-        f"{chr(10).join(bullets)}\n\n"
-        "Uncertainty:\n"
-        f"{uncertainty}"
+        f"Answer:\n{chr(10).join(f'- {point}' for point in synthesized_points)}\n\n"
+        f"Sources consulted: {source_note}.\n\n"
+        "Confidence note: I synthesized the online lookup evidence rather than showing the raw retrieved text. "
+        "If this is high-stakes or very current, verify against the primary source."
     )
+
+
+def _synthesize_weather_lookup(results: List[Dict[str, str]], user_prompt: str) -> str:
+    """Turn the structured wttr.in weather snippet into a direct answer without exposing raw context."""
+    for item in results:
+        snippet = item.get("snippet", "")
+        match = re.search(
+            r"Current weather for (?P<area>.*?): (?P<condition>.*?), (?P<temp>-?\d+|\?)\D*F, "
+            r"feels like (?P<feels>-?\d+|\?)\D*F, humidity (?P<humidity>\d+|\?)%, wind (?P<wind>\d+|\?) mph\. "
+            r"Observation time: (?P<observed>.+?)\.?$",
+            snippet,
+            flags=re.I,
+        )
+        if not match:
+            continue
+
+        area = match.group("area").strip()
+        condition = match.group("condition").strip()
+        temp = match.group("temp").strip()
+        feels = match.group("feels").strip()
+        humidity = match.group("humidity").strip()
+        wind = match.group("wind").strip()
+        observed = match.group("observed").strip()
+        return (
+            f"Current snapshot for `{user_prompt}`:\n"
+            f"- {area}: {condition}, about {temp}°F, feeling like {feels}°F.\n"
+            f"- Humidity is around {humidity}% with wind near {wind} mph.\n"
+            f"- Observed: {observed}. Weather changes quickly, so treat this as a live snapshot.\n\n"
+            f"Sources consulted: {_format_source_note([item])}."
+        )
+    return ""
+
+
+def _synthesize_lookup_points(results: List[Dict[str, str]], user_prompt: str, max_points: int = 3) -> List[str]:
+    """Create concise evidence-based points without dumping the raw lookup snippets."""
+    query_terms = {
+        token
+        for token in re.findall(r"[a-z0-9']+", (user_prompt or "").lower())
+        if len(token) > 3 and token not in {"what", "when", "where", "which", "about", "lookup", "search", "online"}
+    }
+    points: List[str] = []
+    seen = set()
+    for item in results[:5]:
+        snippet = _clean_lookup_text(item.get("snippet", ""))
+        title = _clean_lookup_text(item.get("title", ""))
+        if not snippet:
+            continue
+
+        sentences = re.split(r"(?<=[.!?])\s+", snippet)
+        ranked = sorted(
+            [sentence.strip() for sentence in sentences if len(sentence.strip()) >= 30],
+            key=lambda sentence: len(query_terms.intersection(set(re.findall(r"[a-z0-9']+", sentence.lower())))),
+            reverse=True,
+        )
+        chosen = ranked[0] if ranked else snippet
+        chosen = _shorten_lookup_point(chosen)
+        if not chosen:
+            continue
+
+        domain = _domain_from_lookup_item(item)
+        prefix = f"{title}: " if title and title.lower() not in chosen.lower() else ""
+        point = f"{prefix}{chosen}"
+        if domain:
+            point = f"{point} ({domain})"
+        key = re.sub(r"\W+", "", point.lower())[:120]
+        if key in seen:
+            continue
+        seen.add(key)
+        points.append(point)
+        if len(points) >= max_points:
+            break
+    return points
+
+
+def _clean_lookup_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", unescape(text or "")).strip()
+    return text.strip(" \t\r\n-•")
+
+
+def _shorten_lookup_point(text: str, max_chars: int = 220) -> str:
+    text = _clean_lookup_text(text)
+    if len(text) <= max_chars:
+        return text
+    shortened = text[:max_chars].rsplit(" ", 1)[0].strip(" ,;:-")
+    return f"{shortened}..." if shortened else ""
+
+
+def _format_source_note(results: List[Dict[str, str]], max_sources: int = 4) -> str:
+    labels: List[str] = []
+    seen = set()
+    for item in results:
+        label = _domain_from_lookup_item(item) or item.get("source", "online source")
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+        if len(labels) >= max_sources:
+            break
+    return ", ".join(labels) or "online lookup providers"
+
+
+def _domain_from_lookup_item(item: Dict[str, str]) -> str:
+    url = item.get("url", "")
+    domain = urlparse(url).netloc.lower().removeprefix("www.") if url else ""
+    if domain:
+        return domain
+    source = item.get("source", "")
+    return source.split(" via ", 1)[0].strip()
 
 
 def _parse_online_search_results(prompt: str) -> List[Dict[str, str]]:

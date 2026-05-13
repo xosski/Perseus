@@ -28,7 +28,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from html import unescape
 from typing import Dict, List, Optional
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -274,7 +274,9 @@ class SearchAugmentation:
         body: Optional[bytes] = None,
     ) -> Optional[Dict]:
         headers = headers or {}
-        headers.setdefault("User-Agent", "PerseusPortableLLM/1.0")
+        headers.setdefault("User-Agent", self._browser_user_agent())
+        headers.setdefault("Accept", "application/json,text/plain,*/*")
+        headers.setdefault("Accept-Language", "en-US,en;q=0.9")
         try:
             req = Request(url, data=body, headers=headers, method=method)
             with urlopen(req, timeout=self.timeout_seconds) as resp:
@@ -285,13 +287,23 @@ class SearchAugmentation:
 
     def _request_text(self, url: str, headers: Optional[Dict[str, str]] = None) -> str:
         headers = headers or {}
-        headers.setdefault("User-Agent", "PerseusPortableLLM/1.0")
+        headers.setdefault("User-Agent", self._browser_user_agent())
+        headers.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        headers.setdefault("Accept-Language", "en-US,en;q=0.9")
         try:
             req = Request(url, headers=headers)
             with urlopen(req, timeout=self.timeout_seconds) as resp:
                 return resp.read().decode("utf-8", errors="replace")
         except Exception:
             return ""
+
+    @staticmethod
+    def _browser_user_agent() -> str:
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
 
     def _search_brave(self, query: str) -> List[SearchResult]:
         url = f"https://api.search.brave.com/res/v1/web/search?q={quote_plus(query)}&count={self.max_results}"
@@ -459,7 +471,7 @@ class SearchAugmentation:
             results.append(
                 SearchResult(
                     title=self._strip_html(title),
-                    url=unescape(url),
+                    url=self._clean_result_url(unescape(url)),
                     snippet=self._strip_html(snippet),
                     source="duckduckgo_html",
                     retrieved_utc=now,
@@ -474,7 +486,7 @@ class SearchAugmentation:
 
         lines = [
             "ONLINE SEARCH CONTEXT",
-            "Use this context carefully. Treat snippets as leads, not final truth.",
+            "Internal evidence only: use these lookup results to synthesize an answer, but do not paste or quote raw snippets/context to the user.",
             f"Search query: {query}",
             "",
             "Results:",
@@ -491,7 +503,8 @@ class SearchAugmentation:
 
         lines.append(
             "Instruction: Answer using the search context only when it is relevant. "
-            "Separate confirmed facts from assumptions. Mention uncertainty when snippets are thin."
+            "Analyze and paraphrase the evidence in your own words; do not expose the context block, raw snippets, or lookup payload. "
+            "Separate confirmed facts from assumptions and mention uncertainty when snippets are thin."
         )
         return "\n".join(lines)
 
@@ -503,6 +516,16 @@ class SearchAugmentation:
         text = re.sub(r"<.*?>", " ", text or "", flags=re.DOTALL)
         text = unescape(text)
         return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _clean_result_url(url: str) -> str:
+        """Resolve common search-result redirect URLs into their real destination."""
+        parsed = urlparse(url or "")
+        if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+            target = (parse_qs(parsed.query).get("uddg") or [""])[0]
+            if target:
+                return unquote(target)
+        return url
 
     def _dedupe_results(self, results: List[SearchResult]) -> List[SearchResult]:
         seen = set()
