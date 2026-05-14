@@ -426,7 +426,7 @@ class BrainStateEngine:
 
         constraints = [
             "answer the user's actual question first",
-            "do not expose internal memory, brain-state, or search scaffolding",
+            "do not expose internal memory, brain-state, search scaffolding, chain-of-thought, scratchpad notes, or hidden planning",
             "separate facts from assumptions",
             "prefer concrete steps over generic meta-analysis",
         ]
@@ -503,8 +503,8 @@ class BrainStateEngine:
     def _lesson_from_quality(self, input_text: str, response_text: str, quality_score: int, issues: List[str]) -> str:
         lower_response = (response_text or "").lower()
 
-        if "question anatomy" in lower_response or "supporting points from lookup" in lower_response:
-            return "Do not let scaffolding become the user-visible answer."
+        if any(marker in lower_response for marker in ["question anatomy", "supporting points from lookup", "<think", "chain of thought", "scratchpad", "hidden planning", "internal reasoning"]):
+            return "Do not let scaffolding or private reasoning become the user-visible answer."
         if "i do not have enough clean source context" in lower_response:
             return "When context is thin, still answer simple stable questions directly."
         if quality_score < 60:

@@ -1030,9 +1030,11 @@ class SelfImprovementStore:
         if reason_blob.count("missing actionable next steps") >= 2:
             guidance.append("Always close with concrete next steps that can be executed immediately.")
         if reason_blob.count("limited explicit reasoning depth") >= 3:
-            guidance.append("Show explicit cause/effect reasoning, assumptions, and trade-offs.")
+            guidance.append("Explain conclusions with cause/effect, assumptions, and trade-offs without exposing chain-of-thought.")
         if reason_blob.count("too short for an educated response") >= 2 or avg_chars < 350:
             guidance.append("Increase depth with practical details, not filler.")
+        if reason_blob.count("exposes internal reasoning or hidden planning") >= 1:
+            guidance.append("Keep scratchpad, hidden planning, and private reasoning out of the visible answer.")
         if reason_blob.count("did not clearly ground answer in ingested context") >= 2:
             guidance.append("When context exists, explicitly cite what was used from ingested knowledge.")
 
@@ -1113,6 +1115,79 @@ SENSITIVE_MEMORY_MARKERS = {
     "token",
 }
 
+INTERNAL_REASONING_HEADINGS = [
+    "chain of thought",
+    "chain-of-thought",
+    "thought process",
+    "thinking process",
+    "internal reasoning",
+    "hidden reasoning",
+    "hidden planning",
+    "private reasoning",
+    "scratchpad",
+    "model thinking",
+    "my thinking",
+]
+
+INTERNAL_REASONING_LEAK_MARKERS = [
+    "<think",
+    "</think>",
+    "chain of thought",
+    "chain-of-thought",
+    "thought process",
+    "thinking process",
+    "internal reasoning",
+    "hidden reasoning",
+    "hidden planning",
+    "private reasoning",
+    "scratchpad",
+    "model thinking",
+    "current prompt payload",
+    "predictive learning context",
+    "cognitive functions context",
+    "asynchronous / echowiring",
+    "use as probabilistic background memory",
+]
+
+
+def _sanitize_visible_response(response: Optional[str]) -> str:
+    """Remove private model reasoning and hidden scaffolding before users or learning stores see it."""
+    text = (response or "").strip()
+    if not text:
+        return ""
+
+    text = re.sub(r"(?is)<think(?:ing)?>.*?</think(?:ing)?>\s*", "", text)
+    text = re.sub(r"(?is)<think(?:ing)?>.*\Z", "", text)
+
+    for heading in INTERNAL_REASONING_HEADINGS:
+        heading_pattern = re.escape(heading).replace(r"\ ", r"[ -]")
+        text = re.sub(
+            rf"(?ims)^\s{{0,3}}(?:#{{1,6}}\s*)?{heading_pattern}\s*:?\s*$.*?(?=^\s{{0,3}}(?:#{{1,6}}\s*)?[A-Z][^\n]{{0,80}}:\s*$|\Z)",
+            "",
+            text,
+        )
+
+    text = re.sub(
+        r"(?im)^\s*(?:let me think|i need to think|i'll think|i will think|let's reason through this|i need to reason through this)\b.*$",
+        "",
+        text,
+    )
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _contains_internal_reasoning_leak(response: Optional[str]) -> bool:
+    """Detect visible private reasoning/scaffolding that should never be shown to users."""
+    lower = (response or "").lower()
+    if any(marker in lower for marker in INTERNAL_REASONING_LEAK_MARKERS):
+        return True
+    return bool(
+        re.search(
+            r"(?im)^\s{0,3}(?:#{1,6}\s*)?(?:thinking|scratchpad|chain[- ]of[- ]thought|hidden reasoning|private reasoning|internal reasoning)\s*:",
+            response or "",
+        )
+    )
+
 
 class PortableLLM:
     """Portable LLM orchestrator with quality-controlled responses."""
@@ -1129,7 +1204,8 @@ class PortableLLM:
             "You are Perseus, a smart, practical technical assistant. "
             "Provide accurate, genuine, context-aware responses with candid, intelligent feedback. "
             "When the user asks a question, infer the relevant who, what, when, where, why, and how dimensions, "
-            "then synthesize a direct answer with mechanism, context, implications, and next steps when useful. "
+            "then synthesize a direct answer with mechanism, context, implications, and next steps when useful; "
+            "keep private reasoning, chain-of-thought, scratchpad notes, and hidden planning out of user-visible output. "
             "Act as the user's personal knowledge assistant: prefer learned source material, local files, "
             "ingested context, and relevant user-provided chat knowledge over sending the user to browse manually. "
             "Avoid hollow praise, filler, and generic disclaimers; be useful, honest, and actionable."
@@ -1434,13 +1510,21 @@ class PortableLLM:
             self.stats.offline_fallbacks += 1
             logger.warning("No provider response available; using OfflineLLM fallback")
             response = self.offline.generate(user_input=prompt, mood=profile.mood, system_prompt=self.system_prompt)
+            response = _sanitize_visible_response(response)
             provider_used = "offline"
             quality = self._assess_quality(response, profile)
 
         if enriched.has_context and response and quality.score < self._quality_threshold:
             response = self._build_grounded_response(prompt=prompt, context=enriched.context_preview)
+            response = _sanitize_visible_response(response)
             provider_used = "grounded-fallback"
             quality = self._assess_quality(response, profile, has_context=True)
+            refined = True
+
+        sanitized_response = _sanitize_visible_response(response)
+        if response and sanitized_response != str(response).strip():
+            response = sanitized_response
+            quality = self._assess_quality(response, profile, has_context=enriched.has_context)
             refined = True
 
         if response and str(response).strip() and getattr(self, "brain_state_engine", None):
@@ -2652,13 +2736,14 @@ class PortableLLM:
         model = self.model if provider_name == self.provider else self._default_model_for(provider_name)
 
         try:
-            return provider.generate(
+            generated = provider.generate(
                 prompt,
                 messages=messages,
                 model=model,
                 temperature=self.conversation.temperature,
                 max_tokens=self.conversation.max_tokens,
             )
+            return _sanitize_visible_response(generated) or None
         except Exception as exc:
             logger.error("Provider %s generation error: %s", provider_name, exc)
             return None
@@ -2674,6 +2759,7 @@ class PortableLLM:
         response_contract = [
             "Respond like a capable general-purpose assistant: natural, thoughtful, clear, and directly useful.",
             "For every question, first reason internally about the relevant who, what, when, where, why, and how; answer only the dimensions that matter.",
+            "Do not reveal chain-of-thought, hidden planning, scratchpad notes, private reasoning, or internal decision traces; provide concise rationale, evidence, assumptions, and conclusions instead.",
             "Prefer synthesis over trivia: explain the core mechanism, context, consequences, trade-offs, and practical implications.",
             "Use learned user preferences, project facts, and prior chat memory when relevant; do not mention memory unless it improves the answer.",
             "Treat explicit user corrections, standing instructions, and project context as higher-priority memory than casual topic history.",
@@ -2801,6 +2887,10 @@ class PortableLLM:
         if any(marker and marker in lower for marker in filler_markers):
             score -= 10
             reasons.append("Contains filler or hollow agreement instead of direct value")
+
+        if _contains_internal_reasoning_leak(text):
+            score -= 45
+            reasons.append("Exposes internal reasoning or hidden planning")
 
         insight_signals = [
             "because",
@@ -3967,7 +4057,7 @@ def _predictive_lesson_for_turn(profile: PromptProfile, quality: ResponseQuality
         )
     elif quality.score >= 72:
         parts.append(
-            f"For {profile.intent} prompts, the response was acceptable but should keep improving specificity and reasoning signals."
+            f"For {profile.intent} prompts, the response was acceptable but should keep improving specificity, visible rationale, and privacy-safe explanations."
         )
     else:
         parts.append(
