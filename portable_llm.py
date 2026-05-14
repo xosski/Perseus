@@ -33,9 +33,10 @@ import xml.etree.ElementTree as ET
 import zipfile
 from typing import Dict, List, Optional, Tuple
 from urllib.error import URLError
-from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.parse import quote_plus, urldefrag, urljoin, urlparse
 from urllib.request import Request, urlopen
 import hashlib
+import inspect
 from typing import List, Dict, Optional
 try:
     from llm_conversation_core import ConversationManager
@@ -504,11 +505,14 @@ DEFAULT_KNOWLEDGE_FOLDER = "knowledge"
 DEFAULT_PRINCESS_PROTOCOL_FOLDER = "Princess protocol"
 DEFAULT_AUTO_KNOWLEDGE_FOLDERS = (DEFAULT_KNOWLEDGE_FOLDER, DEFAULT_PRINCESS_PROTOCOL_FOLDER)
 MODULES_FOLDER = "Modules"
+MODULE_SCRIPT_EXTENSIONS = {".py", ".pyw", ".txt"}
+MODULE_SKIP_DIR_NAMES = {"__pycache__", ".git", ".venv", "venv", "env", "node_modules"}
 PREDICTIVE_LEARNING_MODULE_FILE = "Predictive learning.txt"
 ASYNCHRONOUS_LEARNING_MODULE_FILE = "Asyncronous Learning.txt"
 COGNITIVE_FUNCTIONS_MODULE_FILE = "Cognitive Functions.txt"
 BRAIN_STATE_MODULE_FILE = "Brain State.py"
 SEARCH_AUGMENTATION_MODULE_FILE = "Search Augmentation.py"
+ENGLISH_LANGUAGE_MODULE_FILE = "English Language.txt"
 BRAIN_STATE_DB_PATH = "brain_state_memory.db"
 PREDICTIVE_LEARNING_DB_PATH = "predictive_learning_memory.db"
 ECHOWIRING_MEMORY_DB_PATH = "ghostcore_echowiring_memory.db"
@@ -950,6 +954,250 @@ class EnrichedPrompt:
     context_preview: str = ""
 
 
+@dataclass
+class SearchDecision:
+    """Small decision object compatible with optional Search Augmentation modules."""
+
+    should_search: bool
+    reason: str = ""
+
+
+class BasicSearchAugmentation:
+    """
+    Built-in online search fallback used when Modules/Search Augmentation.py is not present.
+
+    It is intentionally lightweight:
+    - Searches only when the prompt needs freshness, explicitly asks for lookup, or local context is absent.
+    - Returns compact result snippets for synthesis.
+    - Does not expose raw HTML or search payloads to the user.
+    """
+
+    def __init__(self, db_path: str = SEARCH_CACHE_DB_PATH, allow_network: bool = True):
+        self.db_path = db_path
+        self.allow_network = bool(allow_network)
+        self._lock = threading.Lock()
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._initialize()
+
+    def _initialize(self) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS search_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    query TEXT,
+                    context TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+    def should_search(self, prompt: str, local_context: str = "") -> SearchDecision:
+        if not self.allow_network:
+            return SearchDecision(False, "Network search disabled")
+        if _is_small_talk_prompt(prompt) or _is_capability_prompt(prompt):
+            return SearchDecision(False, "Prompt does not need lookup")
+
+        text = _extract_user_request(prompt)
+        lower = re.sub(r"\s+", " ", text.lower()).strip()
+
+        explicit_lookup = any(
+            marker in lower
+            for marker in [
+                "search online",
+                "look online",
+                "look it up",
+                "google",
+                "browse",
+                "web search",
+                "latest",
+                "current",
+                "today",
+                "now",
+                "recent",
+                "price",
+                "weather",
+                "forecast",
+                "news",
+                "schedule",
+                "release date",
+                "version",
+                "who is the current",
+            ]
+        )
+        if explicit_lookup:
+            return SearchDecision(True, "Prompt requests current or online information")
+
+        if local_context and len(local_context) > 250:
+            return SearchDecision(False, "Relevant local context is available")
+
+        question_like = lower.startswith(("who ", "what ", "when ", "where ", "why ", "how ", "is ", "are ", "does ", "do ", "can "))
+        enough_signal = len(re.findall(r"[a-zA-Z0-9_-]{4,}", lower)) >= 4
+        if question_like and enough_signal:
+            return SearchDecision(True, "Local knowledge is thin; online lookup may improve answer quality")
+
+        return SearchDecision(False, "Local/model response should be enough")
+
+    def search_and_build_context(self, prompt: str, max_results: int = 5, timeout: int = 12) -> str:
+        if not self.allow_network:
+            return ""
+
+        query = _extract_user_request(prompt).strip()
+        cache_key = hashlib.sha256(query.lower().encode("utf-8")).hexdigest()[:32]
+        cached = self._get_cached(cache_key)
+        if cached:
+            return cached
+
+        results: List[Dict[str, str]] = []
+
+        if "weather" in query.lower() or "forecast" in query.lower():
+            weather = self._weather_lookup(query, timeout=timeout)
+            if weather:
+                results.append(weather)
+
+        # Direct URL ingestion/lookup path.
+        for url in re.findall(r"https?://[^\s)\]>\"']+", query):
+            try:
+                payload = fetch_url_text(url, timeout=timeout)
+                snippet = _shorten_lookup_point(payload.get("text", ""), max_chars=450)
+                if snippet:
+                    results.append(
+                        {
+                            "title": payload.get("title") or url,
+                            "source": "direct_url",
+                            "url": url,
+                            "retrieved": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                            "snippet": snippet,
+                        }
+                    )
+            except Exception:
+                continue
+
+        if len(results) < max_results:
+            results.extend(self._duckduckgo_lookup(query, max_results=max_results - len(results), timeout=timeout))
+
+        if not results:
+            return ""
+
+        context = _format_online_search_context(results[:max_results], query=query)
+        self._set_cached(cache_key, query, context)
+        return context
+
+    def _get_cached(self, cache_key: str) -> str:
+        try:
+            with self._lock:
+                row = self.conn.execute("SELECT context FROM search_cache WHERE cache_key = ?", (cache_key,)).fetchone()
+            return str(row["context"] or "") if row else ""
+        except Exception:
+            return ""
+
+    def _set_cached(self, cache_key: str, query: str, context: str) -> None:
+        try:
+            with self._lock:
+                with self.conn:
+                    self.conn.execute(
+                        """
+                        INSERT INTO search_cache (cache_key, query, context)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(cache_key) DO UPDATE SET
+                            query = excluded.query,
+                            context = excluded.context,
+                            created_at = CURRENT_TIMESTAMP
+                        """,
+                        (cache_key, query, context),
+                    )
+        except Exception:
+            return
+
+    def _weather_lookup(self, query: str, timeout: int = 10) -> Dict[str, str]:
+        location = re.sub(r"(?i)\b(weather|forecast|current|today|for|in|at|please|what is|what's)\b", " ", query)
+        location = re.sub(r"\s+", " ", location).strip(" ?.,") or query
+        url = f"https://wttr.in/{quote_plus(location)}?format=j1"
+        try:
+            req = Request(url, headers={"User-Agent": "Perseus/1.0"})
+            with urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            current = (payload.get("current_condition") or [{}])[0]
+            area = location
+            nearest = payload.get("nearest_area") or []
+            if nearest:
+                names = nearest[0].get("areaName") or []
+                if names and names[0].get("value"):
+                    area = names[0]["value"]
+            condition = ((current.get("weatherDesc") or [{}])[0].get("value") or "unknown").strip()
+            temp = current.get("temp_F", "?")
+            feels = current.get("FeelsLikeF", "?")
+            humidity = current.get("humidity", "?")
+            wind = current.get("windspeedMiles", "?")
+            observed = current.get("observation_time", "unknown")
+            snippet = (
+                f"Current weather for {area}: {condition}, {temp} F, feels like {feels} F, "
+                f"humidity {humidity}%, wind {wind} mph. Observation time: {observed}."
+            )
+            return {
+                "title": f"Weather for {area}",
+                "source": "wttr.in",
+                "url": url,
+                "retrieved": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "snippet": snippet,
+            }
+        except Exception:
+            return {}
+
+    def _duckduckgo_lookup(self, query: str, max_results: int = 5, timeout: int = 12) -> List[Dict[str, str]]:
+        url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+        try:
+            req = Request(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                    )
+                },
+            )
+            with urlopen(req, timeout=timeout) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            return []
+
+        results: List[Dict[str, str]] = []
+        pattern = re.compile(
+            r'<a[^>]+class="result__a"[^>]+href="(?P<href>.*?)"[^>]*>(?P<title>.*?)</a>.*?'
+            r'(?:<a[^>]+class="result__snippet"[^>]*>|<div[^>]+class="result__snippet"[^>]*>)(?P<snippet>.*?)</',
+            flags=re.I | re.S,
+        )
+        for match in pattern.finditer(html):
+            href = unescape(re.sub(r"&amp;", "&", match.group("href"))).strip()
+            title = _strip_html_to_text(match.group("title"))
+            snippet = _strip_html_to_text(match.group("snippet"))
+            if not title or not snippet:
+                continue
+            if href.startswith("/l/?"):
+                parsed = urlparse(href)
+                params = dict(part.split("=", 1) for part in parsed.query.split("&") if "=" in part)
+                href = unescape(params.get("uddg", href))
+            results.append(
+                {
+                    "title": title,
+                    "source": "duckduckgo",
+                    "url": href,
+                    "retrieved": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    "snippet": _shorten_lookup_point(snippet, max_chars=450),
+                }
+            )
+            if len(results) >= max_results:
+                break
+        return results
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+
 class SelfImprovementStore:
     """Persist lightweight generation outcomes so prompting can improve over time."""
 
@@ -1149,9 +1397,93 @@ INTERNAL_REASONING_LEAK_MARKERS = [
     "use as probabilistic background memory",
 ]
 
+RAW_CONTEXT_LEAK_MARKERS = [
+    "ingested context:",
+    "online search context",
+    "search decision:",
+    "current prompt payload:",
+    "deterministic brain-state planner directives",
+    "predictive/cognitive learning context",
+    "raw retrieved excerpt",
+    "source:",
+    "retrieved:",
+    "snippet:",
+]
 
-def _sanitize_visible_response(response: Optional[str]) -> str:
-    """Remove private model reasoning and hidden scaffolding before users or learning stores see it."""
+
+def _strip_raw_context_sections(text: str) -> str:
+    """Remove prompt/context payloads if a model echoes them back."""
+    if not text:
+        return ""
+
+    section_headings = [
+        "Ingested context",
+        "ONLINE SEARCH CONTEXT",
+        "Online search context",
+        "Search decision",
+        "Current prompt payload",
+        "Deterministic brain-state planner directives",
+        "Predictive/cognitive learning context",
+        "PREDICTIVE LEARNING",
+        "ASYNCHRONOUS / ECHOWIRING LEARNING",
+        "COGNITIVE FUNCTIONS CONTEXT",
+        "Output requirements",
+        "User request",
+    ]
+
+    heading_pattern = "|".join(re.escape(item) for item in section_headings)
+    text = re.sub(
+        rf"(?ims)^\s*(?:{heading_pattern})\s*:?.*?(?=^\s*(?:Answer|Summary|Conclusion|Next Steps|Recommendation|What this means|In practice)\s*:|\Z)",
+        "",
+        text,
+    )
+
+    # Remove obvious copied source/snippet payload lines, but keep short source summaries.
+    cleaned_lines: List[str] = []
+    source_payload_run = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+
+        payloadish = (
+            lower.startswith(("retrieved:", "snippet:", "url:", "current prompt payload:"))
+            or (lower.startswith("source:") and len(stripped) > 90)
+            or lower.startswith(("1. source:", "2. source:", "3. source:"))
+        )
+        if payloadish:
+            source_payload_run += 1
+            continue
+        source_payload_run = 0
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines)
+
+
+def _strip_prompt_echo(response: str, prompt_payload: str) -> str:
+    """Drop long lines/paragraphs that are copied verbatim from the hidden enriched prompt."""
+    if not response or not prompt_payload:
+        return response or ""
+
+    prompt_compact = re.sub(r"\s+", " ", prompt_payload).lower()
+    kept_paragraphs: List[str] = []
+    for para in re.split(r"\n{2,}", response):
+        compact = re.sub(r"\s+", " ", para).strip()
+        if len(compact) >= 120 and compact.lower() in prompt_compact:
+            continue
+        kept_lines = []
+        for line in para.splitlines():
+            compact_line = re.sub(r"\s+", " ", line).strip()
+            if len(compact_line) >= 100 and compact_line.lower() in prompt_compact:
+                continue
+            kept_lines.append(line)
+        cleaned_para = "\n".join(kept_lines).strip()
+        if cleaned_para:
+            kept_paragraphs.append(cleaned_para)
+    return "\n\n".join(kept_paragraphs)
+
+
+def _sanitize_visible_response(response: Optional[str], prompt_payload: str = "") -> str:
+    """Remove private model reasoning, prompt echoes, and hidden context scaffolding before users or learning stores see it."""
     text = (response or "").strip()
     if not text:
         return ""
@@ -1167,6 +1499,10 @@ def _sanitize_visible_response(response: Optional[str]) -> str:
             text,
         )
 
+    text = _strip_raw_context_sections(text)
+    if prompt_payload:
+        text = _strip_prompt_echo(text, prompt_payload)
+
     text = re.sub(
         r"(?im)^\s*(?:let me think|i need to think|i'll think|i will think|let's reason through this|i need to reason through this)\b.*$",
         "",
@@ -1180,6 +1516,16 @@ def _contains_internal_reasoning_leak(response: Optional[str]) -> bool:
     """Detect visible private reasoning/scaffolding that should never be shown to users."""
     lower = (response or "").lower()
     if any(marker in lower for marker in INTERNAL_REASONING_LEAK_MARKERS):
+        return True
+    raw_context_markers = [
+        "ingested context:",
+        "online search context",
+        "current prompt payload:",
+        "search decision:",
+        "output requirements:",
+        "deterministic brain-state planner directives",
+    ]
+    if any(marker in lower for marker in raw_context_markers):
         return True
     return bool(
         re.search(
@@ -1226,12 +1572,18 @@ class PortableLLM:
             self._load_ollama_smart_content(),
         )
         self.web_learner = self._create_web_learner()
+        self.loaded_script_modules: Dict[str, types.ModuleType] = {}
+        self.module_load_report: List[Dict[str, object]] = []
+        self.dynamic_module_engines: Dict[str, object] = {}
+        self._load_all_script_modules()
         self.improvement_store = SelfImprovementStore()
         self.predictive_memory = self._create_predictive_memory()
         self.echowiring_memory = self._create_echowiring_memory()
         self.cognitive_engine = self._create_cognitive_engine()
         self.brain_state_engine = self._create_brain_state_engine()
         self.search_augmentation = self._create_search_augmentation()
+        self.english_language_engine = self._create_english_language_engine()
+        self.dynamic_module_engines = self._create_dynamic_module_engines()
         self._active_brain_action = None
         self._active_brain_context = ""
 
@@ -1362,12 +1714,336 @@ class PortableLLM:
             logger.warning("Unable to load module %s from %s: %s", module_name, path, exc)
             return None
 
+    def _modules_root(self) -> Path:
+        """Return the local Modules folder used for dynamic Python-style extensions."""
+        return Path(__file__).resolve().parent / MODULES_FOLDER
+
+    @staticmethod
+    def _safe_module_name_from_path(path: Path) -> str:
+        """Create a deterministic import-safe module name for an arbitrary file path."""
+        stem = re.sub(r"[^a-zA-Z0-9_]+", "_", path.stem).strip("_").lower() or "module"
+        digest = hashlib.sha256(str(path).encode("utf-8", errors="ignore")).hexdigest()[:10]
+        return f"perseus_dynamic_{stem}_{digest}"
+
+    @staticmethod
+    def _is_candidate_script_module(path: Path) -> bool:
+        """Return True when a file is a candidate Python/coding module."""
+        if not path.is_file():
+            return False
+        if any(part in MODULE_SKIP_DIR_NAMES for part in path.parts):
+            return False
+        if path.name.startswith("."):
+            return False
+        return path.suffix.lower() in MODULE_SCRIPT_EXTENSIONS
+
+    @staticmethod
+    def _read_module_source(path: Path) -> str:
+        """Read a module-like text file using a tolerant encoding path."""
+        try:
+            return path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return path.read_text(encoding="utf-8", errors="replace")
+
+    @staticmethod
+    def _looks_like_python_source(source: str, path: Path) -> Tuple[bool, str]:
+        """
+        Decide whether a .py/.pyw/.txt file can be safely treated as Python source.
+
+        .txt files are only loaded if they parse as Python. This lets Modules contain
+        notes, prompts, markdown, or doctrine files without executing them accidentally.
+        """
+        if not (source or "").strip():
+            return False, "empty file"
+
+        try:
+            ast.parse(source, filename=str(path))
+        except SyntaxError as exc:
+            return False, f"not valid Python syntax: line {exc.lineno}"
+
+        return True, "valid Python syntax"
+
+    def _load_script_module_from_path(self, path: Path) -> Optional[types.ModuleType]:
+        """Load one Python-compatible module file from Modules/, including .txt scripts."""
+        resolved = path.resolve()
+        key = str(resolved).lower()
+        if key in self.loaded_script_modules:
+            return self.loaded_script_modules[key]
+
+        source = self._read_module_source(resolved)
+        ok, reason = self._looks_like_python_source(source, resolved)
+        record = {
+            "path": str(resolved),
+            "name": resolved.name,
+            "loaded": False,
+            "reason": reason,
+            "module_name": "",
+        }
+        if not ok:
+            self.module_load_report.append(record)
+            logger.info("Skipping non-Python module candidate %s: %s", resolved, reason)
+            return None
+
+        module_name = self._safe_module_name_from_path(resolved)
+        record["module_name"] = module_name
+
+        try:
+            module = types.ModuleType(module_name)
+            module.__file__ = str(resolved)
+            module.__package__ = ""
+            module.__dict__.setdefault("MODULE_FILE", str(resolved))
+            module.__dict__.setdefault("MODULES_ROOT", str(self._modules_root()))
+            sys.modules[module_name] = module
+            exec(compile(source, str(resolved), "exec"), module.__dict__)
+            self.loaded_script_modules[key] = module
+            record["loaded"] = True
+            record["reason"] = "loaded"
+            self.module_load_report.append(record)
+            return module
+        except Exception as exc:
+            sys.modules.pop(module_name, None)
+            record["reason"] = f"load failed: {type(exc).__name__}: {exc}"
+            self.module_load_report.append(record)
+            logger.warning("Unable to load dynamic module %s: %s", resolved, exc)
+            return None
+
+    def _load_all_script_modules(self) -> Dict[str, types.ModuleType]:
+        """
+        Load every Python-compatible coding module in Modules/.
+
+        Supported executable module files:
+        - .py
+        - .pyw
+        - .txt, when the file parses as Python source
+
+        Non-code .txt files are skipped instead of executed.
+        """
+        root = self._modules_root()
+        if not root.exists() or not root.is_dir():
+            logger.info("Modules folder not found at %s", root)
+            return {}
+
+        for path in sorted(root.rglob("*")):
+            if not self._is_candidate_script_module(path):
+                continue
+            self._load_script_module_from_path(path)
+
+        loaded_count = sum(1 for item in self.module_load_report if item.get("loaded"))
+        skipped_count = sum(1 for item in self.module_load_report if not item.get("loaded"))
+        logger.info("Dynamic Modules scan complete: %s loaded, %s skipped", loaded_count, skipped_count)
+        return self.loaded_script_modules
+
+    def _get_loaded_module_by_filename(self, file_name: str) -> Optional[types.ModuleType]:
+        """Return a previously loaded module by exact file name, if available."""
+        target = (file_name or "").lower()
+        for module in self.loaded_script_modules.values():
+            module_file = Path(getattr(module, "__file__", "")).name.lower()
+            if module_file == target:
+                return module
+        return None
+
+    @staticmethod
+    def _call_no_arg_factory(factory):
+        """Call a module factory only when it requires no positional arguments."""
+        try:
+            signature = inspect.signature(factory)
+            required = [
+                param
+                for param in signature.parameters.values()
+                if param.default is inspect.Signature.empty
+                and param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY)
+            ]
+            if required:
+                return None
+        except (TypeError, ValueError):
+            pass
+        try:
+            return factory()
+        except Exception as exc:
+            logger.warning("Module factory failed for %r: %s", factory, exc)
+            return None
+
+    @staticmethod
+    def _module_has_prompt_hooks(obj: object) -> bool:
+        """Detect modules/objects that can contribute hidden prompt context."""
+        hook_names = (
+            "build_prompt_context",
+            "get_prompt_context",
+            "get_context",
+            "analyze",
+            "retrieve_relevant_memory",
+            "build_llm_context",
+        )
+        return any(callable(getattr(obj, name, None)) for name in hook_names)
+
+    def _create_dynamic_module_engines(self) -> Dict[str, object]:
+        """
+        Build generic engines from every loaded module that exposes a supported hook.
+
+        Supported module patterns:
+        - def build_prompt_context(prompt): ...
+        - def get_prompt_context(prompt): ...
+        - def get_context(prompt): ...
+        - def analyze(prompt): ...
+        - def retrieve_relevant_memory(prompt): ...
+        - def build_llm_context(prompt): ...
+        - MODULE_INSTANCE = object_with_hooks
+        - def create_module(): return object_with_hooks
+        - def get_module(): return object_with_hooks
+        - class Module: ...
+        - MODULE_CLASS = SomeClass
+        """
+        engines: Dict[str, object] = {}
+
+        for key, module in self.loaded_script_modules.items():
+            path_name = Path(getattr(module, "__file__", key)).name
+            engine = None
+
+            explicit_instance = getattr(module, "MODULE_INSTANCE", None)
+            if explicit_instance is not None and self._module_has_prompt_hooks(explicit_instance):
+                engine = explicit_instance
+
+            if engine is None:
+                for factory_name in ("create_module", "get_module", "create_engine", "get_engine"):
+                    factory = getattr(module, factory_name, None)
+                    if callable(factory):
+                        candidate = self._call_no_arg_factory(factory)
+                        if candidate is not None and self._module_has_prompt_hooks(candidate):
+                            engine = candidate
+                            break
+
+            if engine is None:
+                for class_name in ("MODULE_CLASS", "Module"):
+                    cls = getattr(module, class_name, None)
+                    if isinstance(cls, type):
+                        candidate = self._call_no_arg_factory(cls)
+                        if candidate is not None and self._module_has_prompt_hooks(candidate):
+                            engine = candidate
+                            break
+
+            if engine is None and self._module_has_prompt_hooks(module):
+                engine = module
+
+            if engine is not None:
+                engines[path_name] = engine
+
+        logger.info("Dynamic module engines available: %s", ", ".join(sorted(engines)) or "none")
+        return engines
+
+    def _module_context_from_engine(self, name: str, engine: object, prompt: str) -> str:
+        """Collect hidden context from one dynamic module engine."""
+        hook_order = (
+            "build_prompt_context",
+            "get_prompt_context",
+            "get_context",
+            "analyze",
+            "retrieve_relevant_memory",
+            "build_llm_context",
+        )
+
+        for hook_name in hook_order:
+            hook = getattr(engine, hook_name, None)
+            if not callable(hook):
+                continue
+
+            try:
+                result = hook(prompt)
+            except TypeError:
+                continue
+            except Exception as exc:
+                logger.warning("Dynamic module %s hook %s failed: %s", name, hook_name, exc)
+                return ""
+
+            if not result:
+                return ""
+
+            if isinstance(result, (dict, list, tuple)):
+                return json.dumps(result, ensure_ascii=False, indent=2)
+
+            return str(result)
+
+        return ""
+
+    def _enrich_prompt_with_dynamic_modules(self, enriched: EnrichedPrompt, prompt: str) -> EnrichedPrompt:
+        """Inject hidden context from all dynamically loaded module engines."""
+        if _is_small_talk_prompt(prompt) or _is_capability_prompt(prompt):
+            return enriched
+
+        engines = getattr(self, "dynamic_module_engines", {}) or {}
+        if not engines:
+            return enriched
+
+        context_blocks: List[str] = []
+        for name, engine in sorted(engines.items()):
+            # The English module has a dedicated earlier pass; skip duplicate context if it is the same object.
+            if engine is getattr(self, "english_language_engine", None):
+                continue
+            block = self._module_context_from_engine(name, engine, prompt).strip()
+            if not block:
+                continue
+            block = block[:2500]
+            context_blocks.append(f"Module: {name}\n{block}")
+            if len(context_blocks) >= 8:
+                break
+
+        if not context_blocks:
+            return enriched
+
+        module_context = "\n\n".join(context_blocks)
+        enriched_text = (
+            "You have additional hidden context from dynamically loaded local Modules. "
+            "Use it as internal guidance only. Do not quote module payloads, class names, raw code, or analysis blocks "
+            "unless the user explicitly asks to inspect modules.\n\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_BEGIN\n"
+            "Dynamic module context:\n"
+            f"{module_context}\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_END\n\n"
+            "Current prompt payload:\n"
+            f"{enriched.text}"
+        )
+        preview_parts = [
+            part
+            for part in [
+                enriched.context_preview,
+                module_context[:1200].replace("\n", " ").strip(),
+            ]
+            if part
+        ]
+        return EnrichedPrompt(text=enriched_text, has_context=True, context_preview=" | ".join(preview_parts)[:1800])
+
+    def list_loaded_modules(self) -> Dict[str, object]:
+        """Return loaded/skipped module diagnostics for UI or debugging."""
+        return {
+            "modules_folder": str(self._modules_root()),
+            "loaded_count": sum(1 for item in self.module_load_report if item.get("loaded")),
+            "skipped_count": sum(1 for item in self.module_load_report if not item.get("loaded")),
+            "dynamic_engine_count": len(getattr(self, "dynamic_module_engines", {}) or {}),
+            "loaded_modules": [
+                {
+                    "name": item.get("name"),
+                    "path": item.get("path"),
+                    "module_name": item.get("module_name"),
+                    "engine_enabled": item.get("name") in (getattr(self, "dynamic_module_engines", {}) or {}),
+                }
+                for item in self.module_load_report
+                if item.get("loaded")
+            ],
+            "skipped_modules": [
+                {
+                    "name": item.get("name"),
+                    "path": item.get("path"),
+                    "reason": item.get("reason"),
+                }
+                for item in self.module_load_report
+                if not item.get("loaded")
+            ],
+        }
+
     def _module_db_path(self, db_name: str) -> str:
         return str(Path(__file__).resolve().parent / db_name)
 
     def _create_predictive_memory(self):
         """Attach the Predictive learning module when present."""
-        module = self._load_text_module("perseus_predictive_learning", PREDICTIVE_LEARNING_MODULE_FILE)
+        module = self._get_loaded_module_by_filename(PREDICTIVE_LEARNING_MODULE_FILE) or self._load_text_module("perseus_predictive_learning", PREDICTIVE_LEARNING_MODULE_FILE)
         cls = getattr(module, "PredictiveLearningMemory", None) if module else None
         if not cls:
             return None
@@ -1379,7 +2055,7 @@ class PortableLLM:
 
     def _create_echowiring_memory(self):
         """Attach the asynchronous/EchoWiring memory module when present."""
-        module = self._load_text_module("perseus_asynchronous_learning", ASYNCHRONOUS_LEARNING_MODULE_FILE)
+        module = self._get_loaded_module_by_filename(ASYNCHRONOUS_LEARNING_MODULE_FILE) or self._load_text_module("perseus_asynchronous_learning", ASYNCHRONOUS_LEARNING_MODULE_FILE)
         cls = getattr(module, "EchoWiringMemory", None) if module else None
         if not cls:
             return None
@@ -1391,7 +2067,7 @@ class PortableLLM:
 
     def _create_cognitive_engine(self):
         """Attach the Cognitive Functions module when present."""
-        module = self._load_text_module("perseus_cognitive_functions", COGNITIVE_FUNCTIONS_MODULE_FILE)
+        module = self._get_loaded_module_by_filename(COGNITIVE_FUNCTIONS_MODULE_FILE) or self._load_text_module("perseus_cognitive_functions", COGNITIVE_FUNCTIONS_MODULE_FILE)
         cls = getattr(module, "GhostCoreCognitiveEngine", None) if module else None
         db_cls = getattr(module, "CognitiveMemoryDB", None) if module else None
         if not cls:
@@ -1407,7 +2083,7 @@ class PortableLLM:
 
     def _create_brain_state_engine(self):
         """Attach the deterministic Brain State module when present."""
-        module = self._load_text_module("perseus_brain_state", BRAIN_STATE_MODULE_FILE)
+        module = self._get_loaded_module_by_filename(BRAIN_STATE_MODULE_FILE) or self._load_text_module("perseus_brain_state", BRAIN_STATE_MODULE_FILE)
         cls = getattr(module, "BrainStateEngine", None) if module else None
         if not cls:
             return None
@@ -1419,20 +2095,82 @@ class PortableLLM:
             return None
 
     def _create_search_augmentation(self):
-        """Attach online search augmentation when the local module is present."""
+        """Attach online search augmentation; fall back to the built-in lightweight searcher if the module is absent."""
         if not self.allow_online_search:
             return None
 
-        module = self._load_text_module("perseus_search_augmentation", SEARCH_AUGMENTATION_MODULE_FILE)
+        module = self._get_loaded_module_by_filename(SEARCH_AUGMENTATION_MODULE_FILE) or self._load_text_module("perseus_search_augmentation", SEARCH_AUGMENTATION_MODULE_FILE)
         cls = getattr(module, "SearchAugmentation", None) if module else None
+        if cls:
+            try:
+                return cls(db_path=self._module_db_path(SEARCH_CACHE_DB_PATH), allow_network=self.allow_online_search)
+            except Exception as exc:
+                logger.warning("Search augmentation module unavailable, using built-in fallback: %s", exc)
+
+        try:
+            return BasicSearchAugmentation(db_path=self._module_db_path(SEARCH_CACHE_DB_PATH), allow_network=self.allow_online_search)
+        except Exception as exc:
+            logger.warning("Built-in search augmentation unavailable: %s", exc)
+            return None
+
+    def _create_english_language_engine(self):
+        """Attach the English Language comprehension module when present."""
+        module = self._get_loaded_module_by_filename(ENGLISH_LANGUAGE_MODULE_FILE) or self._load_text_module("perseus_english_language", ENGLISH_LANGUAGE_MODULE_FILE)
+        cls = getattr(module, "EnglishLanguageModule", None) if module else None
         if not cls:
             return None
 
         try:
-            return cls(db_path=self._module_db_path(SEARCH_CACHE_DB_PATH), allow_network=self.allow_online_search)
+            return cls()
         except Exception as exc:
-            logger.warning("Search augmentation module unavailable: %s", exc)
+            logger.warning("English Language module unavailable: %s", exc)
             return None
+
+    def _enrich_prompt_with_language_engine(self, prompt: str) -> EnrichedPrompt:
+        """
+        Run a pre-analysis English comprehension pass before knowledge/context analysis.
+
+        This module is intentionally hidden from user output. It tells the model how to
+        understand the user's wording, implied task, ambiguity, tone, and expected answer
+        shape before it starts reasoning over retrieved context.
+        """
+        if _is_small_talk_prompt(prompt) or _is_capability_prompt(prompt):
+            return EnrichedPrompt(text=prompt, has_context=False)
+
+        engine = getattr(self, "english_language_engine", None)
+        if not engine:
+            return EnrichedPrompt(text=prompt, has_context=False)
+
+        try:
+            if hasattr(engine, "build_prompt_context"):
+                language_context = engine.build_prompt_context(prompt)
+            elif hasattr(engine, "analyze"):
+                analysis = engine.analyze(prompt)
+                language_context = json.dumps(analysis, ensure_ascii=False, indent=2)
+            else:
+                return EnrichedPrompt(text=prompt, has_context=False)
+        except Exception as exc:
+            logger.warning("English Language pre-analysis failed: %s", exc)
+            return EnrichedPrompt(text=prompt, has_context=False)
+
+        language_context = (language_context or "").strip()
+        if not language_context:
+            return EnrichedPrompt(text=prompt, has_context=False)
+
+        preview = language_context[:1200].replace("\n", " ").strip()
+        enriched_text = (
+            "Before answering, use this English-language comprehension analysis as hidden guidance. "
+            "It is not user-visible content. Do not quote it, label it, or dump it back. "
+            "Use it to understand the request, disambiguate wording, choose the right answer shape, "
+            "and identify what must be answered directly before using any other context.\n\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_BEGIN\n"
+            "English language pre-analysis:\n"
+            f"{language_context}\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_END\n\n"
+            "User request:\n"
+            f"{prompt}"
+        )
+        return EnrichedPrompt(text=enriched_text, has_context=True, context_preview=preview)
 
     def available_providers(self) -> List[str]:
         """Return available providers from existing conversation core."""
@@ -1488,7 +2226,9 @@ class PortableLLM:
                 self._active_brain_action = None
                 self._active_brain_context = ""
 
-        enriched = self._enrich_prompt_with_knowledge(prompt)
+        enriched = self._enrich_prompt_with_language_engine(prompt)
+        enriched = self._enrich_prompt_with_dynamic_modules(enriched, prompt)
+        enriched = self._merge_enriched_prompts(enriched, self._enrich_prompt_with_knowledge(prompt))
         enriched = self._enrich_prompt_with_online_search(enriched, prompt)
         enriched = self._enrich_prompt_with_predictive_modules(enriched, prompt)
         self.conversation.add_message(
@@ -1510,18 +2250,18 @@ class PortableLLM:
             self.stats.offline_fallbacks += 1
             logger.warning("No provider response available; using OfflineLLM fallback")
             response = self.offline.generate(user_input=prompt, mood=profile.mood, system_prompt=self.system_prompt)
-            response = _sanitize_visible_response(response)
+            response = _sanitize_visible_response(response, prompt_payload=prompt)
             provider_used = "offline"
             quality = self._assess_quality(response, profile)
 
         if enriched.has_context and response and quality.score < self._quality_threshold:
             response = self._build_grounded_response(prompt=prompt, context=enriched.context_preview)
-            response = _sanitize_visible_response(response)
+            response = _sanitize_visible_response(response, prompt_payload=enriched.text)
             provider_used = "grounded-fallback"
             quality = self._assess_quality(response, profile, has_context=True)
             refined = True
 
-        sanitized_response = _sanitize_visible_response(response)
+        sanitized_response = _sanitize_visible_response(response, prompt_payload=enriched.text)
         if response and sanitized_response != str(response).strip():
             response = sanitized_response
             quality = self._assess_quality(response, profile, has_context=enriched.has_context)
@@ -1638,6 +2378,9 @@ class PortableLLM:
             "echowiring_memory_enabled": bool(self.echowiring_memory),
             "cognitive_functions_enabled": bool(self.cognitive_engine),
             "online_search_enabled": bool(self.search_augmentation),
+            "english_language_module_enabled": bool(getattr(self, "english_language_engine", None)),
+            "loaded_modules_count": sum(1 for item in getattr(self, "module_load_report", []) if item.get("loaded")),
+            "dynamic_module_engines_count": len(getattr(self, "dynamic_module_engines", {}) or {}),
         }
 
     def set_provider(self, provider: str, model: Optional[str] = None) -> bool:
@@ -2262,13 +3005,26 @@ class PortableLLM:
             pass
         self.web_learner = None
 
+    @staticmethod
+    def _merge_enriched_prompts(primary: EnrichedPrompt, secondary: EnrichedPrompt) -> EnrichedPrompt:
+        """Merge hidden context enrichments without losing the original user request."""
+        if not primary.has_context:
+            return secondary
+        if not secondary.has_context:
+            return primary
+
+        merged_text = (
+            f"{primary.text}\n\n"
+            "Additional hidden retrieved context follows. Use it as evidence only; do not paste it raw.\n\n"
+            f"{secondary.text}"
+        )
+        preview_parts = [primary.context_preview, secondary.context_preview]
+        preview = " | ".join(part for part in preview_parts if part)[:1200]
+        return EnrichedPrompt(text=merged_text, has_context=True, context_preview=preview)
+
     def _enrich_prompt_with_knowledge(self, prompt: str) -> EnrichedPrompt:
         """Inject relevant learned web context into the prompt when available."""
-        if (
-            _is_small_talk_prompt(prompt)
-            or _is_capability_prompt(prompt)
-            or (_is_general_knowledge_prompt(prompt) and not _is_memory_prompt(prompt))
-        ):
+        if _is_small_talk_prompt(prompt) or _is_capability_prompt(prompt):
             return EnrichedPrompt(text=prompt, has_context=False)
 
         if not self.web_learner:
@@ -2288,8 +3044,10 @@ class PortableLLM:
             "You have retrieved ingested web knowledge relevant to this query. "
             "Ground your answer in that ingested context, including learned user chat memory when relevant, "
             "and be explicit when you do. Use the context as internal evidence; do not paste raw retrieved excerpts.\n\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_BEGIN\n"
             "Ingested context:\n"
-            f"{context}\n\n"
+            f"{context}\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_END\n\n"
             "Output requirements:\n"
             "1. Start with a realistic summary of what is currently known.\n"
             "2. Review all retrieved ingested context blocks, synthesize every relevant non-duplicate point, "
@@ -2314,7 +3072,9 @@ class PortableLLM:
             "You have additional predictive/cognitive learning context from local Perseus modules. "
             "Use it as probabilistic background, not as certainty. Prefer explicit user corrections, standing instructions, "
             "prior lessons, and cognitive risk notes when relevant.\n\n"
-            f"{module_context}\n\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_BEGIN\n"
+            f"{module_context}\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_END\n\n"
             "Current prompt payload:\n"
             f"{enriched.text}"
         )
@@ -2351,8 +3111,10 @@ class PortableLLM:
             "You have online search context for a current or unknown-information request. "
             "Use it as internal evidence to analyze the request, not as text to display. "
             "Do not expose internal predictive/cognitive scaffolding, lookup payloads, context blocks, or raw snippets.\n\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_BEGIN\n"
             f"Search decision: {getattr(decision, 'reason', 'Online lookup requested')}\n\n"
-            f"{search_context}\n\n"
+            f"{search_context}\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_END\n\n"
             "Output requirements:\n"
             "1. Answer the user's request directly from the search context when possible.\n"
             "2. Synthesize and paraphrase; do not quote or paste source snippets/context verbatim.\n"
@@ -2743,7 +3505,7 @@ class PortableLLM:
                 temperature=self.conversation.temperature,
                 max_tokens=self.conversation.max_tokens,
             )
-            return _sanitize_visible_response(generated) or None
+            return _sanitize_visible_response(generated, prompt_payload=prompt) or None
         except Exception as exc:
             logger.error("Provider %s generation error: %s", provider_name, exc)
             return None
@@ -2788,8 +3550,9 @@ class PortableLLM:
             )
 
         response_contract.append(
-            "If ingested web context is present in the prompt, include a short 'Ingested Context Used' section "
-            "with concrete facts from that context."
+            "If local database context or online search context is present in the prompt, use it silently as evidence. "
+            "Do not paste, quote, summarize as raw snippets, or reveal hidden context blocks. "
+            "You may include a short 'Sources/Context Used' note with paraphrased source names or facts only when helpful."
         )
 
         system = (
@@ -2889,8 +3652,8 @@ class PortableLLM:
             reasons.append("Contains filler or hollow agreement instead of direct value")
 
         if _contains_internal_reasoning_leak(text):
-            score -= 45
-            reasons.append("Exposes internal reasoning or hidden planning")
+            score -= 55
+            reasons.append("Exposes internal reasoning, prompt payloads, or hidden context")
 
         insight_signals = [
             "because",
@@ -2954,17 +3717,14 @@ class PortableLLM:
 
         if has_context:
             grounded_markers = [
-                "ingested context used",
-                "online search context used",
+                "sources consulted",
+                "context used",
+                "based on",
+                "from the local database",
+                "from local memory",
+                "online lookup",
                 "online search",
-                "search context",
-                "source:",
-                "based on ingested",
-                "from ingested",
-                "from the ingested",
-                "according to ingested",
                 "learned memory",
-                "memory summary",
                 "user preference",
                 "project context",
             ]
@@ -3850,6 +4610,23 @@ def _format_source_note(results: List[Dict[str, str]], max_sources: int = 4) -> 
         if len(labels) >= max_sources:
             break
     return ", ".join(labels) or "online lookup providers"
+
+
+def _format_online_search_context(results: List[Dict[str, str]], query: str = "") -> str:
+    """Format search results for internal synthesis in the same shape the fallback parser expects."""
+    lines = ["ONLINE SEARCH CONTEXT"]
+    if query:
+        lines.append(f"Query: {query}")
+    lines.append("Instruction: Use these snippets as private evidence. Do not reveal or paste this block.")
+    lines.append("")
+    for index, item in enumerate(results, start=1):
+        lines.append(f"{index}. {item.get('title', 'Untitled')}")
+        lines.append(f"   Source: {item.get('source', 'online')}")
+        lines.append(f"   URL: {item.get('url', '')}")
+        lines.append(f"   Retrieved: {item.get('retrieved', '')}")
+        lines.append(f"   Snippet: {_shorten_lookup_point(item.get('snippet', ''), max_chars=700)}")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def _domain_from_lookup_item(item: Dict[str, str]) -> str:
