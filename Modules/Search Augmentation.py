@@ -426,7 +426,12 @@ class SearchAugmentation:
         return ", ".join(part for part in [area, region, country] if part)
 
     def _search_wikipedia(self, query: str) -> List[SearchResult]:
-        topic = re.sub(r"^(tell me about|what is|who is|explain)\s+", "", query.strip(), flags=re.I)
+        topic = re.sub(
+            r"^(tell me about|what is|what are|who is|who are|where is|where are|when is|when did|how is|how are|how does|how do|explain)\s+",
+            "",
+            query.strip(),
+            flags=re.I,
+        )
         topic = topic.strip(" ?.!")
 
         if not topic:
@@ -460,23 +465,24 @@ class SearchAugmentation:
 
         now = self._now_utc()
         results: List[SearchResult] = []
-        blocks = re.findall(
-            r'<a rel="nofollow" class="result__a" href="(.*?)">(.*?)</a>.*?'
-            r'<a class="result__snippet".*?>(.*?)</a>',
-            html,
+        pattern = re.compile(
+            r'<a[^>]+class="result__a"[^>]+href="(?P<url>.*?)"[^>]*>(?P<title>.*?)</a>.*?'
+            r'(?:<a[^>]+class="result__snippet"[^>]*>|<div[^>]+class="result__snippet"[^>]*>)(?P<snippet>.*?)</',
             flags=re.DOTALL | re.I,
         )
 
-        for url, title, snippet in blocks[: self.max_results]:
+        for match in pattern.finditer(html):
             results.append(
                 SearchResult(
-                    title=self._strip_html(title),
-                    url=self._clean_result_url(unescape(url)),
-                    snippet=self._strip_html(snippet),
+                    title=self._strip_html(match.group("title")),
+                    url=self._clean_result_url(unescape(match.group("url"))),
+                    snippet=self._strip_html(match.group("snippet")),
                     source="duckduckgo_html",
                     retrieved_utc=now,
                 )
             )
+            if len(results) >= self.max_results:
+                break
         return results
 
     def build_search_context(self, query: str, results: Optional[List[SearchResult]] = None) -> str:

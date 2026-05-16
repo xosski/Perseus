@@ -499,7 +499,7 @@ except ImportError:
 
 WEB_LEARNING_DB_PATH = "llm_web_learning.db"
 SELF_IMPROVEMENT_DB_PATH = "llm_self_improvement.db"
-MONDAY_PERSONALITY_FILE = "MOnday personality.txt"
+MONDAY_PERSONALITY_FILE = "Monday personality.txt"
 OLLAMA_SMART_CONTENT_FILE = "Ollama smart content.txt"
 DEFAULT_KNOWLEDGE_FOLDER = "knowledge"
 DEFAULT_PRINCESS_PROTOCOL_FOLDER = "Princess protocol"
@@ -513,11 +513,13 @@ COGNITIVE_FUNCTIONS_MODULE_FILE = "Cognitive Functions.txt"
 BRAIN_STATE_MODULE_FILE = "Brain State.py"
 SEARCH_AUGMENTATION_MODULE_FILE = "Search Augmentation.py"
 ENGLISH_LANGUAGE_MODULE_FILE = "English Language.txt"
+AUTONOMOUS_TRAINING_MODULE_FILE = "Autonomous Training.py"
 BRAIN_STATE_DB_PATH = "brain_state_memory.db"
 PREDICTIVE_LEARNING_DB_PATH = "predictive_learning_memory.db"
 ECHOWIRING_MEMORY_DB_PATH = "ghostcore_echowiring_memory.db"
 COGNITIVE_STATE_DB_PATH = "ghostcore_cognitive_state.db"
 SEARCH_CACHE_DB_PATH = "llm_search_cache.db"
+AUTONOMOUS_TRAINING_DB_PATH = "perseus_autonomous_training.db"
 SUPPORTED_KNOWLEDGE_EXTENSIONS = {
     ".txt",
     ".md",
@@ -1393,6 +1395,7 @@ INTERNAL_REASONING_LEAK_MARKERS = [
     "current prompt payload",
     "predictive learning context",
     "cognitive functions context",
+    "autonomous training context",
     "asynchronous / echowiring",
     "use as probabilistic background memory",
 ]
@@ -1404,6 +1407,7 @@ RAW_CONTEXT_LEAK_MARKERS = [
     "current prompt payload:",
     "deterministic brain-state planner directives",
     "predictive/cognitive learning context",
+    "autonomous training context",
     "raw retrieved excerpt",
     "source:",
     "retrieved:",
@@ -1427,6 +1431,7 @@ def _strip_raw_context_sections(text: str) -> str:
         "PREDICTIVE LEARNING",
         "ASYNCHRONOUS / ECHOWIRING LEARNING",
         "COGNITIVE FUNCTIONS CONTEXT",
+        "AUTONOMOUS TRAINING CONTEXT",
         "Output requirements",
         "User request",
     ]
@@ -1571,6 +1576,7 @@ class PortableLLM:
             self._load_monday_personality(),
             self._load_ollama_smart_content(),
         )
+        self._quality_threshold = 72
         self.web_learner = self._create_web_learner()
         self.loaded_script_modules: Dict[str, types.ModuleType] = {}
         self.module_load_report: List[Dict[str, object]] = []
@@ -1583,12 +1589,12 @@ class PortableLLM:
         self.brain_state_engine = self._create_brain_state_engine()
         self.search_augmentation = self._create_search_augmentation()
         self.english_language_engine = self._create_english_language_engine()
+        self.autonomous_trainer = self._create_autonomous_trainer()
         self.dynamic_module_engines = self._create_dynamic_module_engines()
         self._active_brain_action = None
         self._active_brain_context = ""
 
         self.stats = LLMStats()
-        self._quality_threshold = 72
         self._max_history_messages = 20
 
         self.provider = self._resolve_provider(provider)
@@ -1621,8 +1627,13 @@ class PortableLLM:
     @staticmethod
     def _load_monday_personality() -> str:
         """Load Monday's personality prompt from the companion text file without executing it."""
-        path = Path(__file__).resolve().parent / MONDAY_PERSONALITY_FILE
-        if not path.exists():
+        base_path = Path(__file__).resolve().parent
+        candidates = [
+            base_path / MONDAY_PERSONALITY_FILE,
+            base_path / MODULES_FOLDER / MONDAY_PERSONALITY_FILE,
+        ]
+        path = next((candidate for candidate in candidates if candidate.exists()), None)
+        if path is None:
             return ""
 
         try:
@@ -2126,6 +2137,23 @@ class PortableLLM:
             logger.warning("English Language module unavailable: %s", exc)
             return None
 
+    def _create_autonomous_trainer(self):
+        """Attach the autonomous training-data module when present."""
+        module = self._get_loaded_module_by_filename(AUTONOMOUS_TRAINING_MODULE_FILE) or self._load_text_module("perseus_autonomous_training", AUTONOMOUS_TRAINING_MODULE_FILE)
+        cls = getattr(module, "AutonomousTrainingMemory", None) if module else None
+        if not cls:
+            return None
+
+        try:
+            return cls(
+                db_path=self._module_db_path(AUTONOMOUS_TRAINING_DB_PATH),
+                dataset_dir=str(Path(__file__).resolve().parent / "training_datasets"),
+                min_quality_score=self._quality_threshold,
+            )
+        except Exception as exc:
+            logger.warning("Autonomous training module unavailable: %s", exc)
+            return None
+
     def _enrich_prompt_with_language_engine(self, prompt: str) -> EnrichedPrompt:
         """
         Run a pre-analysis English comprehension pass before knowledge/context analysis.
@@ -2319,6 +2347,16 @@ class PortableLLM:
                 provider=provider_used,
                 quality=quality,
             )
+            self._learn_autonomous_training_from_turn(
+                prompt=prompt,
+                response=str(response),
+                profile=profile,
+                provider=provider_used,
+                model=model_used,
+                quality=quality,
+                context_preview=enriched.context_preview,
+                refined=refined,
+            )
 
             metadata = {
                 "provider": provider_used,
@@ -2379,9 +2417,21 @@ class PortableLLM:
             "cognitive_functions_enabled": bool(self.cognitive_engine),
             "online_search_enabled": bool(self.search_augmentation),
             "english_language_module_enabled": bool(getattr(self, "english_language_engine", None)),
+            "autonomous_training_enabled": bool(getattr(self, "autonomous_trainer", None)),
+            "autonomous_training": self._autonomous_training_stats(),
             "loaded_modules_count": sum(1 for item in getattr(self, "module_load_report", []) if item.get("loaded")),
             "dynamic_module_engines_count": len(getattr(self, "dynamic_module_engines", {}) or {}),
         }
+
+    def _autonomous_training_stats(self) -> Dict[str, object]:
+        trainer = getattr(self, "autonomous_trainer", None)
+        if not trainer or not hasattr(trainer, "get_stats"):
+            return {}
+        try:
+            return trainer.get_stats()
+        except Exception as exc:
+            logger.warning("Autonomous training stats failed: %s", exc)
+            return {"error": str(exc)}
 
     def set_provider(self, provider: str, model: Optional[str] = None) -> bool:
         """Switch provider for the active conversation."""
@@ -2412,6 +2462,17 @@ class PortableLLM:
             return {"ok": True, "state": self.brain_state_engine.export_state()}
         except Exception as exc:
             logger.warning("Brain State export failed: %s", exc)
+            return {"ok": False, "error": str(exc)}
+
+    def export_training_dataset(self, output_path: str = "", format: str = "chatml", limit: int = 5000) -> Dict[str, object]:
+        """Export accepted autonomous-training examples for a future native Perseus model."""
+        trainer = getattr(self, "autonomous_trainer", None)
+        if not trainer or not hasattr(trainer, "export_dataset"):
+            return {"ok": False, "error": "Autonomous Training module not loaded"}
+        try:
+            return trainer.export_dataset(output_path=output_path, format=format, accepted_only=True, limit=limit)
+        except Exception as exc:
+            logger.warning("Autonomous training dataset export failed: %s", exc)
             return {"ok": False, "error": str(exc)}
 
     def ingest_web_content(self, url: str, content: str, title: str = "") -> Dict[str, object]:
@@ -2572,6 +2633,43 @@ class PortableLLM:
                 self.cognitive_engine.db.save_brain_snapshot(updated_state)
             except Exception as exc:
                 logger.warning("Cognitive learning update failed: %s", exc)
+
+    def _learn_autonomous_training_from_turn(
+        self,
+        prompt: str,
+        response: str,
+        profile: PromptProfile,
+        provider: str,
+        model: str,
+        quality: ResponseQuality,
+        context_preview: str = "",
+        refined: bool = False,
+    ) -> None:
+        """Store clean high-quality turns as candidate deep-learning examples."""
+        trainer = getattr(self, "autonomous_trainer", None)
+        if not trainer or not hasattr(trainer, "add_interaction"):
+            return
+
+        try:
+            trainer.add_interaction(
+                prompt=prompt,
+                response=response,
+                intent=profile.intent,
+                provider=provider,
+                model=model,
+                quality_score=quality.score,
+                quality_reasons=list(quality.reasons or []),
+                context_preview=context_preview,
+                metadata={
+                    "complexity": profile.complexity,
+                    "mood": profile.mood,
+                    "expected_shape": profile.expected_shape,
+                    "refined": bool(refined),
+                    "strict_local_only": self.strict_local_only,
+                },
+            )
+        except Exception as exc:
+            logger.warning("Autonomous training capture failed: %s", exc)
 
     @staticmethod
     def _memory_categories(memories: List[str]) -> List[str]:
