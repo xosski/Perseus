@@ -119,6 +119,24 @@ Print the runtime safety/privacy/transparency report and exit:
 python cli.py --compliance-report
 ```
 
+Print local growth-learning stats, including distilled memories, lessons, contradictions, and the last benchmark run:
+
+```bash
+python cli.py --growth-report
+```
+
+Replay stored chat memories into compact confidence-scored lessons:
+
+```bash
+python cli.py --experience-replay 80
+```
+
+Run the local self-evaluation benchmark suite:
+
+```bash
+python cli.py --run-benchmarks 3
+```
+
 Disable startup folder ingestion:
 
 ```bash

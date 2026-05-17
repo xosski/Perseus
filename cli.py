@@ -60,9 +60,28 @@ def run() -> int:
         action="store_true",
         help="Print Perseus runtime safety/privacy/transparency controls and exit",
     )
+    parser.add_argument(
+        "--growth-report",
+        action="store_true",
+        help="Print local growth-learning memory, contradiction, and benchmark stats and exit",
+    )
+    parser.add_argument(
+        "--experience-replay",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Replay up to N stored chat-memory documents into distilled growth lessons and exit",
+    )
+    parser.add_argument(
+        "--run-benchmarks",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Run up to N local self-evaluation benchmark prompts and exit",
+    )
     args = parser.parse_args()
 
-    if args.compliance_report:
+    if args.compliance_report or args.growth_report or args.experience_replay or args.run_benchmarks:
         llm = PortableLLM(
             db_path=args.db,
             provider=args.provider,
@@ -73,7 +92,15 @@ def run() -> int:
             enable_chat_learning=not args.no_chat_learning,
         )
         try:
-            print(json.dumps(llm.get_compliance_report(), indent=2))
+            if args.compliance_report:
+                payload = llm.get_compliance_report()
+            elif args.experience_replay:
+                payload = llm.run_experience_replay(limit=args.experience_replay)
+            elif args.run_benchmarks:
+                payload = llm.run_self_evaluation(limit=args.run_benchmarks)
+            else:
+                payload = llm.growth_report()
+            print(json.dumps(payload, indent=2))
         finally:
             llm.close()
         return 0

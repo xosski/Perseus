@@ -499,6 +499,7 @@ except ImportError:
 
 WEB_LEARNING_DB_PATH = "llm_web_learning.db"
 SELF_IMPROVEMENT_DB_PATH = "llm_self_improvement.db"
+GROWTH_LEARNING_DB_PATH = "perseus_growth_learning.db"
 MONDAY_PERSONALITY_FILE = "Monday personality.py"
 MONDAY_PERSONALITY_FALLBACK_FILE = "Monday personality.txt"
 OLLAMA_SMART_CONTENT_FILE = "Ollama smart content.txt"
@@ -1302,6 +1303,345 @@ class SelfImprovementStore:
             self.conn.close()
 
 
+class GrowthLearningStore:
+    """Local growth layer for distilled lessons, benchmark results, and memory confidence."""
+
+    DEFAULT_BENCHMARKS = [
+        {
+            "prompt": "Explain Perseus internal tri-channel logic: parser channel, brain-state channel, and final logic control in two short paragraphs.",
+            "category": "architecture",
+            "expected_terms": ["parser", "brain", "final", "answer"],
+            "forbidden_terms": ["chain of thought", "scratchpad", "raw_context_do_not_output"],
+        },
+        {
+            "prompt": "Give a concise debugging plan for a Python import error.",
+            "category": "coding",
+            "expected_terms": ["traceback", "path", "environment", "import"],
+            "forbidden_terms": ["as an ai language model", "i cannot help"],
+        },
+        {
+            "prompt": "A user asks for current weather but online search is unavailable. What should Perseus do?",
+            "category": "uncertainty",
+            "expected_terms": ["current", "uncertain", "source", "location"],
+            "forbidden_terms": ["definitely", "guaranteed"],
+        },
+    ]
+
+    def __init__(self, db_path: str = GROWTH_LEARNING_DB_PATH):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._initialize()
+
+    def _initialize(self) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS growth_memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    source TEXT,
+                    category TEXT,
+                    statement TEXT UNIQUE,
+                    evidence TEXT,
+                    confidence REAL,
+                    last_confirmed_at TEXT,
+                    contradiction_count INTEGER DEFAULT 0,
+                    superseded_by INTEGER
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS growth_lessons (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    lesson TEXT UNIQUE,
+                    evidence TEXT,
+                    confidence REAL,
+                    support_count INTEGER DEFAULT 1,
+                    source TEXT
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS benchmark_cases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    prompt TEXT UNIQUE,
+                    category TEXT,
+                    expected_terms TEXT,
+                    forbidden_terms TEXT,
+                    enabled INTEGER DEFAULT 1
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS benchmark_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    case_count INTEGER,
+                    average_score REAL,
+                    passed_count INTEGER
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS benchmark_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER,
+                    case_id INTEGER,
+                    prompt TEXT,
+                    score INTEGER,
+                    passed INTEGER,
+                    reasons TEXT,
+                    response_excerpt TEXT,
+                    metadata TEXT
+                )
+                """
+            )
+        self._seed_benchmark_cases()
+
+    def _seed_benchmark_cases(self) -> None:
+        with self._lock:
+            with self.conn:
+                for case in self.DEFAULT_BENCHMARKS:
+                    self.conn.execute(
+                        """
+                        INSERT INTO benchmark_cases
+                        (prompt, category, expected_terms, forbidden_terms, enabled)
+                        VALUES (?, ?, ?, ?, 1)
+                        ON CONFLICT(prompt) DO UPDATE SET
+                            category = excluded.category,
+                            expected_terms = excluded.expected_terms,
+                            forbidden_terms = excluded.forbidden_terms,
+                            enabled = 1
+                        """,
+                        (
+                            case["prompt"],
+                            case["category"],
+                            json.dumps(case["expected_terms"]),
+                            json.dumps(case["forbidden_terms"]),
+                        ),
+                    )
+
+    def record_memory(
+        self,
+        statement: str,
+        category: str = "general",
+        evidence: str = "",
+        confidence: float = 0.55,
+        source: str = "chat",
+    ) -> Dict[str, object]:
+        statement = re.sub(r"\s+", " ", (statement or "")).strip(" -")
+        if not statement:
+            return {"ok": False, "reason": "empty_statement"}
+
+        confidence = max(0.05, min(0.99, float(confidence)))
+        now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        contradictions = self._find_contradictions(statement, category=category)
+
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO growth_memories
+                    (source, category, statement, evidence, confidence, last_confirmed_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(statement) DO UPDATE SET
+                        updated_at = CURRENT_TIMESTAMP,
+                        evidence = excluded.evidence,
+                        confidence = MIN(0.99, MAX(growth_memories.confidence, excluded.confidence) + 0.03),
+                        last_confirmed_at = excluded.last_confirmed_at
+                    """,
+                    (source, category, statement, evidence[:1200], confidence, now),
+                )
+                if contradictions:
+                    self.conn.execute(
+                        """
+                        UPDATE growth_memories
+                        SET contradiction_count = contradiction_count + 1,
+                            confidence = MAX(0.05, confidence - 0.12),
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id IN ({})
+                        """.format(",".join("?" for _ in contradictions)),
+                        [int(item["id"]) for item in contradictions],
+                    )
+                    self.conn.execute(
+                        """
+                        UPDATE growth_memories
+                        SET contradiction_count = contradiction_count + ?,
+                            confidence = MAX(0.05, confidence - ?),
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE statement = ?
+                        """,
+                        (len(contradictions), min(0.24, 0.08 * len(contradictions)), statement),
+                    )
+
+        return {"ok": True, "statement": statement, "contradictions": contradictions}
+
+    def record_lesson(
+        self,
+        lesson: str,
+        evidence: str = "",
+        confidence: float = 0.65,
+        source: str = "experience_replay",
+    ) -> bool:
+        lesson = re.sub(r"\s+", " ", (lesson or "")).strip(" -")
+        if not lesson:
+            return False
+        confidence = max(0.05, min(0.99, float(confidence)))
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO growth_lessons (lesson, evidence, confidence, source)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(lesson) DO UPDATE SET
+                        updated_at = CURRENT_TIMESTAMP,
+                        support_count = support_count + 1,
+                        confidence = MIN(0.99, MAX(growth_lessons.confidence, excluded.confidence) + 0.02),
+                        evidence = excluded.evidence
+                    """,
+                    (lesson, evidence[:1200], confidence, source),
+                )
+        return True
+
+    def guidance_for_prompt(self, prompt: str, limit: int = 6) -> Dict[str, object]:
+        terms = [t for t in re.findall(r"[a-zA-Z0-9_-]{3,}", (prompt or "").lower()) if t not in MEMORY_RETRIEVAL_STOPWORDS]
+        lessons = self._search_table("growth_lessons", "lesson", terms, limit=limit)
+        memories = self._search_table("growth_memories", "statement", terms, limit=limit)
+        memory_dicts = [dict(row) for row in memories[:limit]]
+        contradictions = [row for row in memory_dicts if int(row.get("contradiction_count") or 0) > 0]
+        return {
+            "lessons": [dict(row) for row in lessons[:limit]],
+            "memories": memory_dicts,
+            "contradictions": contradictions[:3],
+        }
+
+    def _search_table(self, table: str, text_column: str, terms: List[str], limit: int = 6) -> List[sqlite3.Row]:
+        if not terms:
+            return []
+        rows = self.conn.execute(f"SELECT * FROM {table} ORDER BY updated_at DESC, id DESC LIMIT 200").fetchall()
+        scored = []
+        for row in rows:
+            text = " ".join(str(row[key] or "") for key in row.keys()).lower()
+            score = sum(1 for term in terms if term in text)
+            if score:
+                scored.append((score, row))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [row for _score, row in scored[:limit]]
+
+    def _find_contradictions(self, statement: str, category: str = "general", limit: int = 12) -> List[Dict[str, object]]:
+        existing = self.conn.execute(
+            """
+            SELECT id, statement, confidence, contradiction_count
+            FROM growth_memories
+            WHERE category = ? AND superseded_by IS NULL
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (category, int(limit)),
+        ).fetchall()
+        return [dict(row) for row in existing if self._statements_contradict(statement, row["statement"])]
+
+    @staticmethod
+    def _statements_contradict(left: str, right: str) -> bool:
+        left_l = left.lower()
+        right_l = right.lower()
+        pairs = [
+            (["concise", "short", "brief"], ["detailed", "deep", "thorough", "sophisticated"]),
+            (["local only", "offline", "no online"], ["online", "web search", "browse"]),
+            (["do not", "don't", "avoid", "never"], ["should", "prefer", "always", "must"]),
+            (["structured", "bullets", "sections"], ["casual", "plain prose", "unstructured"]),
+        ]
+        shared_terms = set(re.findall(r"[a-zA-Z0-9_-]{4,}", left_l)) & set(re.findall(r"[a-zA-Z0-9_-]{4,}", right_l))
+        if len(shared_terms) < 2:
+            return False
+        for a_terms, b_terms in pairs:
+            if any(term in left_l for term in a_terms) and any(term in right_l for term in b_terms):
+                return True
+            if any(term in left_l for term in b_terms) and any(term in right_l for term in a_terms):
+                return True
+        return False
+
+    def benchmark_cases(self, limit: int = 50) -> List[Dict[str, object]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, prompt, category, expected_terms, forbidden_terms
+            FROM benchmark_cases
+            WHERE enabled = 1
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        out = []
+        for row in rows:
+            out.append({
+                "id": int(row["id"]),
+                "prompt": row["prompt"],
+                "category": row["category"],
+                "expected_terms": json.loads(row["expected_terms"] or "[]"),
+                "forbidden_terms": json.loads(row["forbidden_terms"] or "[]"),
+            })
+        return out
+
+    def record_benchmark_run(self, results: List[Dict[str, object]]) -> Dict[str, object]:
+        case_count = len(results)
+        average_score = sum(int(item.get("score") or 0) for item in results) / max(1, case_count)
+        passed_count = sum(1 for item in results if item.get("passed"))
+        with self._lock:
+            with self.conn:
+                cur = self.conn.execute(
+                    "INSERT INTO benchmark_runs (case_count, average_score, passed_count) VALUES (?, ?, ?)",
+                    (case_count, average_score, passed_count),
+                )
+                run_id = int(cur.lastrowid)
+                for item in results:
+                    self.conn.execute(
+                        """
+                        INSERT INTO benchmark_results
+                        (run_id, case_id, prompt, score, passed, reasons, response_excerpt, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            item.get("case_id"),
+                            item.get("prompt"),
+                            int(item.get("score") or 0),
+                            1 if item.get("passed") else 0,
+                            "\n".join(item.get("reasons") or []),
+                            str(item.get("response") or "")[:1000],
+                            json.dumps(item.get("metadata") or {}, ensure_ascii=False),
+                        ),
+                    )
+        return {"run_id": run_id, "case_count": case_count, "average_score": round(average_score, 2), "passed_count": passed_count}
+
+    def stats(self) -> Dict[str, object]:
+        with self._lock:
+            memory_count = self.conn.execute("SELECT COUNT(*) FROM growth_memories").fetchone()[0]
+            lesson_count = self.conn.execute("SELECT COUNT(*) FROM growth_lessons").fetchone()[0]
+            contradiction_count = self.conn.execute("SELECT COALESCE(SUM(contradiction_count), 0) FROM growth_memories").fetchone()[0]
+            run = self.conn.execute("SELECT * FROM benchmark_runs ORDER BY id DESC LIMIT 1").fetchone()
+        return {
+            "db_path": self.db_path,
+            "growth_memories": int(memory_count or 0),
+            "growth_lessons": int(lesson_count or 0),
+            "memory_contradictions": int(contradiction_count or 0),
+            "last_benchmark": dict(run) if run else None,
+        }
+
+    def close(self) -> None:
+        with self._lock:
+            self.conn.close()
+
+
 DEFAULT_NEWS_SOURCES = [
     "http://rss.cnn.com/rss/cnn_topstories.rss",
     "http://feeds.foxnews.com/foxnews/latest",
@@ -1404,6 +1744,8 @@ INTERNAL_REASONING_LEAK_MARKERS = [
     "parser packet",
     "brain-state channel",
     "final logic control",
+    "growth learning context",
+    "confidence-scored memories",
     "predictive learning context",
     "cognitive functions context",
     "autonomous training context",
@@ -1419,6 +1761,7 @@ RAW_CONTEXT_LEAK_MARKERS = [
     "tri-channel logic control",
     "parser packet",
     "final logic control",
+    "growth learning context",
     "deterministic brain-state planner directives",
     "predictive/cognitive learning context",
     "autonomous training context",
@@ -1441,6 +1784,8 @@ def _strip_raw_context_sections(text: str) -> str:
         "Brain-state channel",
         "Final logic control",
         "Parser packet",
+        "GROWTH LEARNING CONTEXT",
+        "Growth learning context",
         "Ingested context",
         "ONLINE SEARCH CONTEXT",
         "Online search context",
@@ -1610,6 +1955,7 @@ class PortableLLM:
         self.dynamic_module_engines: Dict[str, object] = {}
         self._load_all_script_modules()
         self.improvement_store = SelfImprovementStore()
+        self.growth_store = GrowthLearningStore(db_path=self._module_db_path(GROWTH_LEARNING_DB_PATH))
         self.predictive_memory = self._create_predictive_memory()
         self.echowiring_memory = self._create_echowiring_memory()
         self.cognitive_engine = self._create_cognitive_engine()
@@ -2466,6 +2812,7 @@ class PortableLLM:
         enriched = self._merge_enriched_prompts(enriched, self._enrich_prompt_with_knowledge(prompt))
         enriched = self._enrich_prompt_with_online_search(enriched, prompt)
         enriched = self._enrich_prompt_with_predictive_modules(enriched, prompt)
+        enriched = self._enrich_prompt_with_growth_learning(enriched, prompt)
         enriched = self._build_tri_channel_final_prompt(prompt, enriched, parser_packet, brain_meta)
         self.conversation.add_message(
             "user",
@@ -2600,6 +2947,13 @@ class PortableLLM:
                     provider=provider_used,
                     quality=quality,
                 )
+                self._learn_growth_from_turn(
+                    prompt=prompt,
+                    response=str(response),
+                    profile=profile,
+                    provider=provider_used,
+                    quality=quality,
+                )
                 self._learn_autonomous_training_from_turn(
                     prompt=prompt,
                     response=str(response),
@@ -2682,7 +3036,9 @@ class PortableLLM:
             "autonomous_training_enabled": bool(getattr(self, "autonomous_trainer", None)),
             "introspective_learning_enabled": bool(getattr(self, "introspective_learning", None)),
             "tri_channel_logic_enabled": True,
+            "growth_learning_enabled": bool(getattr(self, "growth_store", None)),
             "autonomous_training": self._autonomous_training_stats(),
+            "growth_learning": self.growth_store.stats() if getattr(self, "growth_store", None) else {},
             "loaded_modules_count": sum(1 for item in getattr(self, "module_load_report", []) if item.get("loaded")),
             "dynamic_module_engines_count": len(getattr(self, "dynamic_module_engines", {}) or {}),
         }
@@ -2757,6 +3113,8 @@ class PortableLLM:
     def close(self) -> None:
         """Release local resources."""
         self.improvement_store.close()
+        if getattr(self, "growth_store", None):
+            self.growth_store.close()
         if self.web_learner:
             self.web_learner.close()
         if self.offline:
@@ -2795,6 +3153,171 @@ class PortableLLM:
             # Keep learner enabled on single ingest errors so later sources can still be learned.
             logger.warning("Web content ingest failed for %s: %s", url, exc)
             return {"ok": False, "error": str(exc)}
+
+    def _learn_growth_from_turn(
+        self,
+        prompt: str,
+        response: str,
+        profile: PromptProfile,
+        provider: str,
+        quality: ResponseQuality,
+    ) -> None:
+        """Distill a finished turn into growth lessons and confidence-scored memories."""
+        store = getattr(self, "growth_store", None)
+        if not store:
+            return
+
+        try:
+            summaries = self._extract_memory_summary(prompt, response, profile, quality)
+            confidence = max(0.15, min(0.98, float(quality.score) / 100.0))
+            prompt_compact = re.sub(r"\s+", " ", (prompt or "").strip())[:500]
+            evidence = (
+                f"prompt={prompt_compact} | "
+                f"provider={provider}; intent={profile.intent}; quality={quality.score}; "
+                f"reasons={'; '.join((quality.reasons or [])[:4])}"
+            )
+            for summary in summaries[:MAX_MEMORY_SUMMARY_BULLETS]:
+                category = "preference" if "preference" in summary.lower() or "user prefers" in summary.lower() else profile.intent
+                store.record_memory(
+                    statement=summary,
+                    category=category,
+                    evidence=evidence,
+                    confidence=confidence,
+                    source="chat_turn",
+                )
+
+            lesson = _predictive_lesson_for_turn(profile, quality, summaries)
+            if lesson:
+                store.record_lesson(lesson=lesson, evidence=evidence, confidence=confidence, source="chat_turn")
+        except Exception as exc:
+            logger.warning("Growth learning write failed: %s", exc)
+
+    def run_experience_replay(self, limit: int = 80) -> Dict[str, object]:
+        """
+        Batch-distill existing chat-memory documents into compact lessons/memories.
+
+        This is the offline growth pass: it replays stored experience into a smaller,
+        confidence-scored policy memory instead of stuffing whole chats into context.
+        """
+        store = getattr(self, "growth_store", None)
+        learner = getattr(self, "web_learner", None)
+        conn = getattr(learner, "conn", None)
+        if not store or not conn:
+            return {"ok": False, "error": "Growth store or learned-document store unavailable"}
+
+        try:
+            rows = conn.execute(
+                """
+                SELECT title, content, updated_at
+                FROM learned_documents
+                WHERE title LIKE 'chat-memory/%' OR url LIKE 'perseus://chat-memory/%'
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+        memories = 0
+        lessons = 0
+        contradictions = 0
+        for row in rows:
+            content = str(row["content"] or "")
+            title = str(row["title"] or "chat-memory")
+            quality_match = re.search(r"(?im)^Quality score:\s*(\d+)", content)
+            quality_score = int(quality_match.group(1)) if quality_match else 65
+            confidence = max(0.15, min(0.96, quality_score / 100.0))
+            intent_match = re.search(r"(?im)^Intent:\s*(.+)$", content)
+            category = (intent_match.group(1).strip() if intent_match else "experience")[:60]
+            summary_match = re.search(r"(?ims)^Memory summary:\s*(.*?)(?:^Retrieval keywords:|^User input:|\Z)", content)
+            summary_block = summary_match.group(1) if summary_match else ""
+            bullets = [line.strip(" -\t") for line in summary_block.splitlines() if line.strip(" -\t")]
+            evidence = re.sub(r"\s+", " ", content).strip()[:1200]
+
+            for bullet in bullets[:MAX_MEMORY_SUMMARY_BULLETS]:
+                result = store.record_memory(
+                    statement=bullet,
+                    category="preference" if "preference" in bullet.lower() or "prefers" in bullet.lower() else category,
+                    evidence=evidence,
+                    confidence=confidence,
+                    source="experience_replay",
+                )
+                if result.get("ok"):
+                    memories += 1
+                    contradictions += len(result.get("contradictions") or [])
+
+            if bullets:
+                lesson = f"For {category} requests, preserve: {'; '.join(bullets[:3])}"
+                if store.record_lesson(lesson=lesson, evidence=f"Replay source: {title}. {evidence}", confidence=confidence, source="experience_replay"):
+                    lessons += 1
+
+        return {
+            "ok": True,
+            "replayed_documents": len(rows),
+            "memories_recorded": memories,
+            "lessons_recorded": lessons,
+            "contradictions_detected": contradictions,
+            "growth_stats": store.stats(),
+        }
+
+    def run_self_evaluation(self, limit: int = 20) -> Dict[str, object]:
+        """Run the local benchmark suite and persist scored results."""
+        store = getattr(self, "growth_store", None)
+        if not store:
+            return {"ok": False, "error": "Growth store unavailable"}
+
+        cases = store.benchmark_cases(limit=limit)
+        results: List[Dict[str, object]] = []
+        previous_learning = self.enable_chat_learning
+        self.enable_chat_learning = False
+        try:
+            for case in cases:
+                response, metadata = self.ask_with_metadata(str(case["prompt"]))
+                text = (response or "").lower()
+                expected = [str(term).lower() for term in case.get("expected_terms", [])]
+                forbidden = [str(term).lower() for term in case.get("forbidden_terms", [])]
+                expected_hits = sum(1 for term in expected if term in text)
+                forbidden_hits = [term for term in forbidden if term in text]
+                heuristic_score = int(metadata.get("quality_score") or 0)
+                coverage_score = int((expected_hits / max(1, len(expected))) * 100)
+                score = max(0, min(100, round((heuristic_score * 0.65) + (coverage_score * 0.35) - (20 * len(forbidden_hits)))))
+                reasons = list(metadata.get("quality_reasons") or [])
+                if expected_hits < len(expected):
+                    missing = [term for term in expected if term not in text]
+                    reasons.append("Missing expected benchmark terms: " + ", ".join(missing[:5]))
+                if forbidden_hits:
+                    reasons.append("Contains forbidden benchmark terms: " + ", ".join(forbidden_hits[:5]))
+                results.append({
+                    "case_id": case["id"],
+                    "prompt": case["prompt"],
+                    "category": case["category"],
+                    "score": score,
+                    "passed": score >= self._quality_threshold and not forbidden_hits,
+                    "reasons": reasons,
+                    "response": response,
+                    "metadata": {
+                        "provider": metadata.get("provider"),
+                        "model": metadata.get("model"),
+                        "quality_score": metadata.get("quality_score"),
+                        "expected_hits": expected_hits,
+                        "expected_total": len(expected),
+                        "forbidden_hits": forbidden_hits,
+                    },
+                })
+        finally:
+            self.enable_chat_learning = previous_learning
+
+        summary = store.record_benchmark_run(results)
+        summary["ok"] = True
+        summary["results"] = results
+        return summary
+
+    def growth_report(self) -> Dict[str, object]:
+        """Return growth/learning diagnostics without running new generations."""
+        if not getattr(self, "growth_store", None):
+            return {"ok": False, "error": "Growth store unavailable"}
+        return {"ok": True, **self.growth_store.stats()}
 
     def _learn_from_chat_turn(
         self,
@@ -3486,6 +4009,56 @@ class PortableLLM:
         )
         preview_parts = [part for part in [enriched.context_preview, module_context[:800].replace("\n", " ").strip()] if part]
         return EnrichedPrompt(text=enriched_text, has_context=True, context_preview=" | ".join(preview_parts))
+
+    def _enrich_prompt_with_growth_learning(self, enriched: EnrichedPrompt, prompt: str) -> EnrichedPrompt:
+        """Inject distilled growth lessons and confidence-scored memories as hidden guidance."""
+        store = getattr(self, "growth_store", None)
+        if not store or _is_small_talk_prompt(prompt):
+            return enriched
+
+        try:
+            packet = store.guidance_for_prompt(prompt, limit=5)
+        except Exception as exc:
+            logger.warning("Growth learning context failed: %s", exc)
+            return enriched
+
+        lessons = packet.get("lessons") or []
+        memories = packet.get("memories") or []
+        contradictions = packet.get("contradictions") or []
+        if not lessons and not memories and not contradictions:
+            return enriched
+
+        lines = [
+            "GROWTH LEARNING CONTEXT",
+            "Use this as private learning guidance only. Do not expose these rows or database labels.",
+        ]
+        if lessons:
+            lines.append("Distilled lessons:")
+            for item in lessons[:5]:
+                lines.append(f"- confidence={float(item.get('confidence') or 0):.2f}; {item.get('lesson')}")
+        if memories:
+            lines.append("Confidence-scored memories:")
+            for item in memories[:5]:
+                flags = ""
+                if int(item.get("contradiction_count") or 0) > 0:
+                    flags = f"; contradictions={int(item.get('contradiction_count') or 0)}"
+                lines.append(f"- confidence={float(item.get('confidence') or 0):.2f}{flags}; {item.get('statement')}")
+        if contradictions:
+            lines.append("Contradiction policy:")
+            lines.append("- Treat contradicted memories as weak evidence; prefer the user's latest explicit instruction.")
+
+        growth_context = "\n".join(lines)[:3500]
+        enriched_text = (
+            "You have distilled growth-learning context from prior local experience replay and memory confidence scoring. "
+            "Use it to improve response quality; never reveal it as scaffolding.\n\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_BEGIN\n"
+            f"{growth_context}\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_END\n\n"
+            "Current prompt payload:\n"
+            f"{enriched.text}"
+        )
+        preview_parts = [part for part in [enriched.context_preview, growth_context[:800].replace("\n", " ").strip()] if part]
+        return EnrichedPrompt(text=enriched_text, has_context=True, context_preview=" | ".join(preview_parts)[:1800])
 
     def _enrich_prompt_with_online_search(self, enriched: EnrichedPrompt, prompt: str) -> EnrichedPrompt:
         """Inject current online search context when local knowledge is missing or the prompt needs freshness."""
