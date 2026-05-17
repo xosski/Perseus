@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import importlib.machinery
 import json
 import logging
 import subprocess
@@ -68,7 +69,15 @@ def load_class(file_name: str, class_name: str):
     if existing is not None and hasattr(existing, class_name):
         return getattr(existing, class_name)
 
-    spec = importlib.util.spec_from_file_location(module_key, path)
+    # importlib.util.spec_from_file_location() does not always create a loader
+    # for extensionless or .txt Python source files. Several Perseus modules are
+    # intentionally stored as .txt, so provide an explicit SourceFileLoader.
+    if path.suffix.lower() in {".txt", ""}:
+        loader = importlib.machinery.SourceFileLoader(module_key, str(path))
+        spec = importlib.util.spec_from_loader(module_key, loader, origin=str(path))
+    else:
+        spec = importlib.util.spec_from_file_location(module_key, path)
+
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not create import spec for {path}")
 
@@ -89,6 +98,27 @@ def load_class(file_name: str, class_name: str):
     return getattr(module, class_name)
 
 
+
+def load_class_any(file_names, class_name: str):
+    """
+    Try multiple possible filenames for the same class.
+
+    This lets renamed modules keep working, e.g.
+    Asyncronous Learning.txt -> Asyncronous Learning.py
+    """
+    last_error = None
+    for file_name in file_names:
+        try:
+            return load_class(file_name, class_name)
+        except Exception as exc:
+            last_error = exc
+            logger.debug("Could not load %s from %s: %s", class_name, file_name, exc)
+
+    raise ImportError(
+        f"Could not load {class_name} from any of: {file_names}. Last error: {last_error}"
+    )
+
+
 def _optional_load_class(file_name: str, class_name: str):
     """Load a class if available; log and return None if it is missing."""
     try:
@@ -98,10 +128,21 @@ def _optional_load_class(file_name: str, class_name: str):
         return None
 
 
+def _optional_load_class_any(file_names, class_name: str):
+    """Load a class from any available filename; log once and return None if all fail."""
+    try:
+        return load_class_any(file_names, class_name)
+    except Exception as exc:
+        logger.warning("Could not load %s from any of %s: %s", class_name, file_names, exc)
+        return None
+
+
+
+
 BrainStateEngine = _optional_load_class("Brain State.py", "BrainStateEngine")
 IntrospectiveLearning = _optional_load_class("Introspective Learning.py", "IntrospectiveLearning")
 AutonomousTrainingMemory = _optional_load_class("Autonomous Training.py", "AutonomousTrainingMemory")
-EchoWiringMemory = _optional_load_class("Asyncronous Learning.txt", "EchoWiringMemory")
+EchoWiringMemory = _optional_load_class_any(["Asyncronous Learning.py", "Asyncronous Learning.txt"], "EchoWiringMemory")
 
 
 class NullBrainStateEngine:

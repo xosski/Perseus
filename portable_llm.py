@@ -508,7 +508,8 @@ MODULES_FOLDER = "Modules"
 MODULE_SCRIPT_EXTENSIONS = {".py", ".pyw", ".txt"}
 MODULE_SKIP_DIR_NAMES = {"__pycache__", ".git", ".venv", "venv", "env", "node_modules"}
 PREDICTIVE_LEARNING_MODULE_FILE = "Predictive learning.txt"
-ASYNCHRONOUS_LEARNING_MODULE_FILE = "Asyncronous Learning.txt"
+ASYNCHRONOUS_LEARNING_MODULE_FILE = "Asyncronous Learning.py"
+ASYNCHRONOUS_LEARNING_MODULE_FALLBACK_FILE = "Asyncronous Learning.txt"
 COGNITIVE_FUNCTIONS_MODULE_FILE = "Cognitive Functions.txt"
 BRAIN_STATE_MODULE_FILE = "Brain State.py"
 SEARCH_AUGMENTATION_MODULE_FILE = "Search Augmentation.py"
@@ -2070,10 +2071,29 @@ class PortableLLM:
             return None
 
     def _create_echowiring_memory(self):
-        """Attach the asynchronous/EchoWiring memory module when present."""
-        module = self._get_loaded_module_by_filename(ASYNCHRONOUS_LEARNING_MODULE_FILE) or self._load_text_module("perseus_asynchronous_learning", ASYNCHRONOUS_LEARNING_MODULE_FILE)
+        """Attach the asynchronous/EchoWiring memory module when present.
+
+        Supports both:
+        - Asyncronous Learning.py  (preferred)
+        - Asyncronous Learning.txt (legacy)
+        """
+        module = None
+        for file_name in (ASYNCHRONOUS_LEARNING_MODULE_FILE, ASYNCHRONOUS_LEARNING_MODULE_FALLBACK_FILE):
+            module = (
+                self._get_loaded_module_by_filename(file_name)
+                or self._load_text_module("perseus_asynchronous_learning", file_name)
+            )
+            if module and getattr(module, "EchoWiringMemory", None):
+                break
+
         cls = getattr(module, "EchoWiringMemory", None) if module else None
         if not cls:
+            logger.warning(
+                "EchoWiring memory module unavailable: expected %s or %s in %s",
+                ASYNCHRONOUS_LEARNING_MODULE_FILE,
+                ASYNCHRONOUS_LEARNING_MODULE_FALLBACK_FILE,
+                self._modules_root(),
+            )
             return None
         try:
             return cls(db_path=self._module_db_path(ECHOWIRING_MEMORY_DB_PATH))
