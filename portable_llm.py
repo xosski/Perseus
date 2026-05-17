@@ -514,12 +514,14 @@ BRAIN_STATE_MODULE_FILE = "Brain State.py"
 SEARCH_AUGMENTATION_MODULE_FILE = "Search Augmentation.py"
 ENGLISH_LANGUAGE_MODULE_FILE = "English Language.txt"
 AUTONOMOUS_TRAINING_MODULE_FILE = "Autonomous Training.py"
+INTROSPECTIVE_LEARNING_MODULE_FILE = "Introspective Learning.py"
 BRAIN_STATE_DB_PATH = "brain_state_memory.db"
 PREDICTIVE_LEARNING_DB_PATH = "predictive_learning_memory.db"
 ECHOWIRING_MEMORY_DB_PATH = "ghostcore_echowiring_memory.db"
 COGNITIVE_STATE_DB_PATH = "ghostcore_cognitive_state.db"
 SEARCH_CACHE_DB_PATH = "llm_search_cache.db"
 AUTONOMOUS_TRAINING_DB_PATH = "perseus_autonomous_training.db"
+INTROSPECTIVE_LEARNING_DB_PATH = "introspective_learning.db"
 SUPPORTED_KNOWLEDGE_EXTENSIONS = {
     ".txt",
     ".md",
@@ -1564,7 +1566,9 @@ class PortableLLM:
     ):
         self.strict_local_only = bool(strict_local_only)
         self.allow_online_search = bool(allow_online_search)
-        self._local_provider_order = ["ollama", "fallback"]
+        # Local deterministic/fallback path should be tried before Ollama.
+        # Ollama stays available, but it is treated as a rare rescue provider.
+        self._local_provider_order = ["fallback", "ollama"]
         self.manager = ConversationManager(db_path=db_path)
         self.offline = (
             OfflineLLM(use_knowledge_db=True)
@@ -1590,6 +1594,7 @@ class PortableLLM:
         self.search_augmentation = self._create_search_augmentation()
         self.english_language_engine = self._create_english_language_engine()
         self.autonomous_trainer = self._create_autonomous_trainer()
+        self.introspective_learning = self._create_introspective_learning()
         self.dynamic_module_engines = self._create_dynamic_module_engines()
         self._active_brain_action = None
         self._active_brain_context = ""
@@ -2154,6 +2159,146 @@ class PortableLLM:
             logger.warning("Autonomous training module unavailable: %s", exc)
             return None
 
+    def _load_adjacent_python_text_module(self, module_name: str, file_name: str):
+        """
+        Load a Python-compatible module from the same folder as portable_llm.py.
+
+        This complements _load_text_module(), which looks inside Modules/. It lets
+        development copies like "Introspective Learning.py" sit beside portable_llm.py
+        without requiring a Modules/ move first.
+        """
+        path = Path(__file__).resolve().parent / file_name
+        if not path.exists():
+            return None
+
+        try:
+            source = path.read_text(encoding="utf-8")
+            ast.parse(source, filename=str(path))
+            module = types.ModuleType(module_name)
+            module.__file__ = str(path)
+            module.__package__ = ""
+            sys.modules[module_name] = module
+            exec(compile(source, str(path), "exec"), module.__dict__)
+            return module
+        except Exception as exc:
+            sys.modules.pop(module_name, None)
+            logger.warning("Unable to load adjacent module %s from %s: %s", module_name, path, exc)
+            return None
+
+    def _create_introspective_learning(self):
+        """Attach the post-response repair / self-review layer when present."""
+        module = (
+            self._get_loaded_module_by_filename(INTROSPECTIVE_LEARNING_MODULE_FILE)
+            or self._load_text_module("perseus_introspective_learning", INTROSPECTIVE_LEARNING_MODULE_FILE)
+            or self._load_adjacent_python_text_module("perseus_introspective_learning_adjacent", INTROSPECTIVE_LEARNING_MODULE_FILE)
+        )
+        cls = getattr(module, "IntrospectiveLearning", None) if module else None
+        if not cls:
+            return None
+
+        try:
+            return cls(db_path=self._module_db_path(INTROSPECTIVE_LEARNING_DB_PATH))
+        except Exception as exc:
+            logger.warning("Introspective Learning module unavailable: %s", exc)
+            return None
+
+    @staticmethod
+    def _quality_from_introspective_critique(critique, fallback_score: int = 70) -> ResponseQuality:
+        """Convert an IntrospectiveLearning critique object into PortableLLM's quality object."""
+        try:
+            directness = int(getattr(critique, "directness_score", fallback_score))
+            relevance = int(getattr(critique, "relevance_score", fallback_score))
+            completeness = int(getattr(critique, "completeness_score", fallback_score))
+
+            score = round((directness * 0.35) + (relevance * 0.35) + (completeness * 0.30))
+            reasons = list(getattr(critique, "issues", []) or [])
+
+            if getattr(critique, "leakage_detected", False):
+                score -= 35
+                if "Internal leakage detected." not in reasons:
+                    reasons.append("Internal leakage detected.")
+            if getattr(critique, "harmful_scaffolding_detected", False):
+                score -= 25
+                if "Harmful scaffolding detected." not in reasons:
+                    reasons.append("Harmful scaffolding detected.")
+            if not getattr(critique, "answered_question", True):
+                score -= 20
+                if "Did not clearly answer the user's question." not in reasons:
+                    reasons.append("Did not clearly answer the user's question.")
+
+            score = max(0, min(100, int(score)))
+            if not reasons:
+                reasons = ["Introspective review passed"]
+
+            return ResponseQuality(score=score, reasons=reasons)
+        except Exception:
+            return ResponseQuality(score=int(fallback_score), reasons=["Introspective review score fallback used"])
+
+    def _apply_introspective_repair(
+        self,
+        prompt: str,
+        response: Optional[str],
+        profile: PromptProfile,
+        enriched: EnrichedPrompt,
+        current_quality: ResponseQuality,
+    ) -> Tuple[Optional[str], ResponseQuality, bool, Optional[Dict[str, object]]]:
+        """
+        Final self-review gate before the answer is shown or captured as memory/training data.
+
+        The introspection module is allowed to repair weak answers and strip leaked
+        scaffolding, but it never gets to expose its own critique to the user.
+        """
+        engine = getattr(self, "introspective_learning", None)
+        if not engine or not response:
+            return response, current_quality, False, None
+
+        try:
+            repaired, critique = engine.analyze_and_correct(
+                user_prompt=prompt,
+                response_text=str(response),
+                rewrite_callback=None,
+                search_context=enriched.context_preview,
+            )
+            repaired = _sanitize_visible_response(repaired, prompt_payload=enriched.text)
+            if not repaired:
+                return response, current_quality, False, None
+
+            introspective_quality = self._quality_from_introspective_critique(
+                critique,
+                fallback_score=current_quality.score,
+            )
+
+            # Keep the stricter score when the review found issues. This prevents
+            # weak/repaired answers from being over-promoted into training data.
+            if repaired.strip() != str(response).strip():
+                final_quality = introspective_quality
+                changed = True
+            elif introspective_quality.score < current_quality.score:
+                final_quality = introspective_quality
+                changed = False
+            else:
+                final_quality = current_quality
+                if introspective_quality.reasons and introspective_quality.reasons != ["Introspective review passed"]:
+                    final_quality = ResponseQuality(
+                        score=current_quality.score,
+                        reasons=list(dict.fromkeys(list(current_quality.reasons or []) + introspective_quality.reasons)),
+                    )
+                changed = False
+
+            meta = {
+                "score": introspective_quality.score,
+                "reasons": introspective_quality.reasons,
+                "changed_response": changed,
+                "confidence": getattr(critique, "confidence", None),
+                "answered_question": getattr(critique, "answered_question", None),
+                "leakage_detected": getattr(critique, "leakage_detected", None),
+                "harmful_scaffolding_detected": getattr(critique, "harmful_scaffolding_detected", None),
+            }
+            return repaired, final_quality, changed, meta
+        except Exception as exc:
+            logger.warning("Introspective Learning repair failed: %s", exc)
+            return response, current_quality, False, {"error": str(exc)}
+
     def _enrich_prompt_with_language_engine(self, prompt: str) -> EnrichedPrompt:
         """
         Run a pre-analysis English comprehension pass before knowledge/context analysis.
@@ -2295,6 +2440,43 @@ class PortableLLM:
             quality = self._assess_quality(response, profile, has_context=enriched.has_context)
             refined = True
 
+        introspection_meta = None
+        response, quality, introspection_changed, introspection_meta = self._apply_introspective_repair(
+            prompt=prompt,
+            response=response,
+            profile=profile,
+            enriched=enriched,
+            current_quality=quality,
+        )
+        if introspection_changed:
+            refined = True
+
+        # Ollama is the rare rescue path: only use it after the local/fallback answer,
+        # grounding rescue, sanitizer, and introspection have all failed to clear the
+        # quality threshold.
+        if (
+            response
+            and quality.score < self._quality_threshold
+            and provider_used != "ollama"
+            and "ollama" in self.manager.providers
+            and getattr(self.manager.providers.get("ollama"), "available", False)
+        ):
+            ollama_response = self._generate_with_provider("ollama", enriched.text, profile, refine=False, prior_response=None)
+            ollama_quality = self._assess_quality(ollama_response, profile, has_context=enriched.has_context)
+            ollama_response, ollama_quality, ollama_changed, ollama_intro_meta = self._apply_introspective_repair(
+                prompt=prompt,
+                response=ollama_response,
+                profile=profile,
+                enriched=enriched,
+                current_quality=ollama_quality,
+            )
+            if ollama_response and ollama_quality.score > quality.score:
+                response = ollama_response
+                quality = ollama_quality
+                provider_used = "ollama"
+                refined = bool(refined or ollama_changed)
+                introspection_meta = ollama_intro_meta or introspection_meta
+
         if response and str(response).strip() and getattr(self, "brain_state_engine", None):
             try:
                 self.brain_state_engine.update_after_response(
@@ -2328,6 +2510,7 @@ class PortableLLM:
                     "offline": used_offline,
                     "grounded_with_ingested_context": enriched.has_context,
                     "brain_state": brain_meta,
+                    "introspection": introspection_meta,
                 },
             )
             self.manager._save_conversation(self.conversation)
@@ -2371,6 +2554,7 @@ class PortableLLM:
                 "context_preview": enriched.context_preview,
                 "strict_local_only": self.strict_local_only,
                 "brain_state": brain_meta,
+                "introspection": introspection_meta,
             }
             return response, metadata
 
@@ -2418,6 +2602,7 @@ class PortableLLM:
             "online_search_enabled": bool(self.search_augmentation),
             "english_language_module_enabled": bool(getattr(self, "english_language_engine", None)),
             "autonomous_training_enabled": bool(getattr(self, "autonomous_trainer", None)),
+            "introspective_learning_enabled": bool(getattr(self, "introspective_learning", None)),
             "autonomous_training": self._autonomous_training_stats(),
             "loaded_modules_count": sum(1 for item in getattr(self, "module_load_report", []) if item.get("loaded")),
             "dynamic_module_engines_count": len(getattr(self, "dynamic_module_engines", {}) or {}),
@@ -3507,12 +3692,21 @@ class PortableLLM:
         )
 
     def _provider_candidates(self) -> List[str]:
-        """Rank providers for this request, preserving selected primary first."""
-        ordered = [self.provider]
+        """
+        Rank providers for this request.
+
+        In strict-local mode, Ollama is deliberately last. The normal path is the
+        deterministic/local fallback plus memory/repair layers; Ollama is reserved
+        for the later rescue pass in ask_with_metadata().
+        """
         if self.strict_local_only:
-            ordered.extend(self._local_provider_order)
+            ordered = ["fallback"]
+            if self.provider not in {"ollama", "fallback"}:
+                ordered.append(self.provider)
+            ordered.append("ollama")
         else:
-            ordered.extend(["ollama", "openai", "mistral", "azure", "fallback"])
+            ordered = [self.provider, "openai", "mistral", "azure", "fallback", "ollama"]
+
         seen = set()
         candidates: List[str] = []
 
