@@ -107,6 +107,18 @@ Disable online search augmentation for a fully offline session:
 python cli.py --no-online-search
 ```
 
+Disable durable learning from chat turns while still allowing manual knowledge ingestion:
+
+```bash
+python cli.py --no-chat-learning
+```
+
+Print the runtime safety/privacy/transparency report and exit:
+
+```bash
+python cli.py --compliance-report
+```
+
 Disable startup folder ingestion:
 
 ```bash
@@ -246,6 +258,14 @@ from portable_llm import PortableLLM
 - A module can contribute hidden prompt context by exposing a compatible object/function such as `MODULE_INSTANCE`, `build_prompt_context(prompt)`, `get_prompt_context(prompt)`, `get_context(prompt)`, or `analyze(prompt)`.
 - Module context is treated as hidden scaffolding. User-visible responses should not mention raw module names, hidden context blocks, chain-of-thought, scratchpads, or internal reasoning unless the user explicitly asks to inspect modules.
 - `Perseus_Memory_Orchestrator.py` is useful as a reference/optional wrapper, but `portable_llm.py` already performs the main orchestration internally.
+
+## Safety, Privacy, and Transparency Notes
+
+- `--compliance-report` prints a runtime self-assessment of local-only mode, chat-learning state, online-search state, sanitizer/repair controls, audit databases, and loaded modules.
+- The compliance report is a transparency aid, not a legal certification against every AI standard.
+- `--no-chat-learning` disables durable learning from chat turns into the web learner, predictive memory, EchoWiring memory, cognitive memory, and autonomous-training capture.
+- `--no-online-search` disables online search augmentation for sessions that must remain fully offline.
+- Strict local-only mode blocks remote providers unless `--allow-fallbacks` is explicitly used.
 
 ## Portability Notes
 

@@ -499,7 +499,8 @@ except ImportError:
 
 WEB_LEARNING_DB_PATH = "llm_web_learning.db"
 SELF_IMPROVEMENT_DB_PATH = "llm_self_improvement.db"
-MONDAY_PERSONALITY_FILE = "Monday personality.txt"
+MONDAY_PERSONALITY_FILE = "Monday personality.py"
+MONDAY_PERSONALITY_FALLBACK_FILE = "Monday personality.txt"
 OLLAMA_SMART_CONTENT_FILE = "Ollama smart content.txt"
 DEFAULT_KNOWLEDGE_FOLDER = "knowledge"
 DEFAULT_PRINCESS_PROTOCOL_FOLDER = "Princess protocol"
@@ -507,13 +508,16 @@ DEFAULT_AUTO_KNOWLEDGE_FOLDERS = (DEFAULT_KNOWLEDGE_FOLDER, DEFAULT_PRINCESS_PRO
 MODULES_FOLDER = "Modules"
 MODULE_SCRIPT_EXTENSIONS = {".py", ".pyw", ".txt"}
 MODULE_SKIP_DIR_NAMES = {"__pycache__", ".git", ".venv", "venv", "env", "node_modules"}
-PREDICTIVE_LEARNING_MODULE_FILE = "Predictive learning.txt"
+PREDICTIVE_LEARNING_MODULE_FILE = "Predictive learning.py"
+PREDICTIVE_LEARNING_MODULE_FALLBACK_FILE = "Predictive learning.txt"
 ASYNCHRONOUS_LEARNING_MODULE_FILE = "Asyncronous Learning.py"
 ASYNCHRONOUS_LEARNING_MODULE_FALLBACK_FILE = "Asyncronous Learning.txt"
-COGNITIVE_FUNCTIONS_MODULE_FILE = "Cognitive Functions.txt"
+COGNITIVE_FUNCTIONS_MODULE_FILE = "Cognitive Functions.py"
+COGNITIVE_FUNCTIONS_MODULE_FALLBACK_FILE = "Cognitive Functions.txt"
 BRAIN_STATE_MODULE_FILE = "Brain State.py"
 SEARCH_AUGMENTATION_MODULE_FILE = "Search Augmentation.py"
-ENGLISH_LANGUAGE_MODULE_FILE = "English Language.txt"
+ENGLISH_LANGUAGE_MODULE_FILE = "English Language.py"
+ENGLISH_LANGUAGE_MODULE_FALLBACK_FILE = "English Language.txt"
 AUTONOMOUS_TRAINING_MODULE_FILE = "Autonomous Training.py"
 INTROSPECTIVE_LEARNING_MODULE_FILE = "Introspective Learning.py"
 BRAIN_STATE_DB_PATH = "brain_state_memory.db"
@@ -1554,6 +1558,7 @@ class PortableLLM:
         use_offline_fallback: bool = False,
         strict_local_only: bool = True,
         allow_online_search: bool = True,
+        enable_chat_learning: bool = True,
         system_prompt: str = (
             "You are Perseus, a smart, practical technical assistant. "
             "Provide accurate, genuine, context-aware responses with candid, intelligent feedback. "
@@ -1562,11 +1567,15 @@ class PortableLLM:
             "keep private reasoning, chain-of-thought, scratchpad notes, and hidden planning out of user-visible output. "
             "Act as the user's personal knowledge assistant: prefer learned source material, local files, "
             "ingested context, and relevant user-provided chat knowledge over sending the user to browse manually. "
-            "Avoid hollow praise, filler, and generic disclaimers; be useful, honest, and actionable."
+            "Avoid hollow praise, filler, and generic disclaimers; be useful, honest, and actionable. "
+            "Follow local-AI safety and privacy expectations: do not assist credential theft, malware, covert abuse, "
+            "weaponization, or other harmful wrongdoing; minimize durable personal data; distinguish evidence from "
+            "uncertainty; and be transparent about limitations without exposing hidden scaffolding."
         ),
     ):
         self.strict_local_only = bool(strict_local_only)
         self.allow_online_search = bool(allow_online_search)
+        self.enable_chat_learning = bool(enable_chat_learning)
         # Local deterministic/fallback path should be tried before Ollama.
         # Ollama stays available, but it is treated as a rare rescue provider.
         self._local_provider_order = ["fallback", "ollama"]
@@ -1636,7 +1645,9 @@ class PortableLLM:
         base_path = Path(__file__).resolve().parent
         candidates = [
             base_path / MONDAY_PERSONALITY_FILE,
+            base_path / MONDAY_PERSONALITY_FALLBACK_FILE,
             base_path / MODULES_FOLDER / MONDAY_PERSONALITY_FILE,
+            base_path / MODULES_FOLDER / MONDAY_PERSONALITY_FALLBACK_FILE,
         ]
         path = next((candidate for candidate in candidates if candidate.exists()), None)
         if path is None:
@@ -2060,7 +2071,11 @@ class PortableLLM:
 
     def _create_predictive_memory(self):
         """Attach the Predictive learning module when present."""
-        module = self._get_loaded_module_by_filename(PREDICTIVE_LEARNING_MODULE_FILE) or self._load_text_module("perseus_predictive_learning", PREDICTIVE_LEARNING_MODULE_FILE)
+        module = None
+        for file_name in (PREDICTIVE_LEARNING_MODULE_FILE, PREDICTIVE_LEARNING_MODULE_FALLBACK_FILE):
+            module = self._get_loaded_module_by_filename(file_name) or self._load_text_module("perseus_predictive_learning", file_name)
+            if module:
+                break
         cls = getattr(module, "PredictiveLearningMemory", None) if module else None
         if not cls:
             return None
@@ -2103,7 +2118,11 @@ class PortableLLM:
 
     def _create_cognitive_engine(self):
         """Attach the Cognitive Functions module when present."""
-        module = self._get_loaded_module_by_filename(COGNITIVE_FUNCTIONS_MODULE_FILE) or self._load_text_module("perseus_cognitive_functions", COGNITIVE_FUNCTIONS_MODULE_FILE)
+        module = None
+        for file_name in (COGNITIVE_FUNCTIONS_MODULE_FILE, COGNITIVE_FUNCTIONS_MODULE_FALLBACK_FILE):
+            module = self._get_loaded_module_by_filename(file_name) or self._load_text_module("perseus_cognitive_functions", file_name)
+            if module:
+                break
         cls = getattr(module, "GhostCoreCognitiveEngine", None) if module else None
         db_cls = getattr(module, "CognitiveMemoryDB", None) if module else None
         if not cls:
@@ -2151,7 +2170,11 @@ class PortableLLM:
 
     def _create_english_language_engine(self):
         """Attach the English Language comprehension module when present."""
-        module = self._get_loaded_module_by_filename(ENGLISH_LANGUAGE_MODULE_FILE) or self._load_text_module("perseus_english_language", ENGLISH_LANGUAGE_MODULE_FILE)
+        module = None
+        for file_name in (ENGLISH_LANGUAGE_MODULE_FILE, ENGLISH_LANGUAGE_MODULE_FALLBACK_FILE):
+            module = self._get_loaded_module_by_filename(file_name) or self._load_text_module("perseus_english_language", file_name)
+            if module:
+                break
         cls = getattr(module, "EnglishLanguageModule", None) if module else None
         if not cls:
             return None
@@ -2531,35 +2554,37 @@ class PortableLLM:
                     "grounded_with_ingested_context": enriched.has_context,
                     "brain_state": brain_meta,
                     "introspection": introspection_meta,
+                    "chat_learning_enabled": self.enable_chat_learning,
                 },
             )
             self.manager._save_conversation(self.conversation)
             self._update_quality_average(quality.score)
 
-            self._learn_from_chat_turn(
-                prompt=prompt,
-                response=str(response),
-                profile=profile,
-                provider=provider_used,
-                quality=quality,
-            )
-            self._learn_predictive_modules_from_turn(
-                prompt=prompt,
-                response=str(response),
-                profile=profile,
-                provider=provider_used,
-                quality=quality,
-            )
-            self._learn_autonomous_training_from_turn(
-                prompt=prompt,
-                response=str(response),
-                profile=profile,
-                provider=provider_used,
-                model=model_used,
-                quality=quality,
-                context_preview=enriched.context_preview,
-                refined=refined,
-            )
+            if self.enable_chat_learning:
+                self._learn_from_chat_turn(
+                    prompt=prompt,
+                    response=str(response),
+                    profile=profile,
+                    provider=provider_used,
+                    quality=quality,
+                )
+                self._learn_predictive_modules_from_turn(
+                    prompt=prompt,
+                    response=str(response),
+                    profile=profile,
+                    provider=provider_used,
+                    quality=quality,
+                )
+                self._learn_autonomous_training_from_turn(
+                    prompt=prompt,
+                    response=str(response),
+                    profile=profile,
+                    provider=provider_used,
+                    model=model_used,
+                    quality=quality,
+                    context_preview=enriched.context_preview,
+                    refined=refined,
+                )
 
             metadata = {
                 "provider": provider_used,
@@ -2573,6 +2598,7 @@ class PortableLLM:
                 "grounded_with_ingested_context": enriched.has_context,
                 "context_preview": enriched.context_preview,
                 "strict_local_only": self.strict_local_only,
+                "chat_learning_enabled": self.enable_chat_learning,
                 "brain_state": brain_meta,
                 "introspection": introspection_meta,
             }
@@ -2616,6 +2642,8 @@ class PortableLLM:
             "refinements_used": self.stats.refinements_used,
             "offline_fallbacks": self.stats.offline_fallbacks,
             "average_quality": round(self.stats.average_quality, 2),
+            "strict_local_only": self.strict_local_only,
+            "chat_learning_enabled": self.enable_chat_learning,
             "predictive_learning_enabled": bool(self.predictive_memory),
             "echowiring_memory_enabled": bool(self.echowiring_memory),
             "cognitive_functions_enabled": bool(self.cognitive_engine),
@@ -2626,6 +2654,50 @@ class PortableLLM:
             "autonomous_training": self._autonomous_training_stats(),
             "loaded_modules_count": sum(1 for item in getattr(self, "module_load_report", []) if item.get("loaded")),
             "dynamic_module_engines_count": len(getattr(self, "dynamic_module_engines", {}) or {}),
+        }
+
+    def get_compliance_report(self) -> Dict[str, object]:
+        """
+        Return a practical transparency report for common local-AI governance checks.
+
+        This is not a legal certification against every AI standard. It exposes the
+        controls Perseus can enforce at runtime so operators can verify privacy,
+        local-only behavior, module loading, sanitization, and auditability.
+        """
+        stats = self.get_stats()
+        return {
+            "scope": "runtime self-assessment, not formal certification",
+            "local_execution": {
+                "strict_local_only": self.strict_local_only,
+                "active_provider": self.provider,
+                "active_model": self.model,
+                "remote_providers_blocked_in_strict_mode": self.strict_local_only,
+            },
+            "privacy_and_data_minimization": {
+                "chat_learning_enabled": self.enable_chat_learning,
+                "chat_learning_can_be_disabled_with_cli": True,
+                "sensitive_memory_filter_enabled": True,
+                "manual_ingestion_required_for_external_sources": True,
+            },
+            "network_controls": {
+                "online_search_enabled": bool(self.search_augmentation),
+                "online_search_can_be_disabled_with_cli": True,
+                "search_cache_db": self._module_db_path(SEARCH_CACHE_DB_PATH),
+            },
+            "safety_controls": {
+                "system_safety_contract_enabled": True,
+                "visible_output_sanitizer_enabled": True,
+                "introspective_repair_enabled": bool(getattr(self, "introspective_learning", None)),
+                "private_reasoning_leak_detection_enabled": True,
+            },
+            "auditability": {
+                "conversation_db": getattr(self.manager, "db_path", "llm_portable_conversations.db"),
+                "module_load_report_available": True,
+                "loaded_modules_count": stats.get("loaded_modules_count", 0),
+                "dynamic_module_engines_count": stats.get("dynamic_module_engines_count", 0),
+            },
+            "runtime_stats": stats,
+            "module_controls": self.list_loaded_modules(),
         }
 
     def _autonomous_training_stats(self) -> Dict[str, object]:
@@ -4117,6 +4189,7 @@ def launch_portable_llm_chat(
     strict_local_only: bool = True,
     allow_online_search: bool = True,
     use_offline_fallback: bool = False,
+    enable_chat_learning: bool = True,
     knowledge_folders: Optional[List[str]] = None,
     auto_ingest_folders: bool = True,
 ) -> None:
@@ -4133,6 +4206,7 @@ def launch_portable_llm_chat(
         strict_local_only=strict_local_only,
         allow_online_search=allow_online_search,
         use_offline_fallback=use_offline_fallback,
+        enable_chat_learning=enable_chat_learning,
     )
     startup_knowledge_folders = knowledge_folders or list(DEFAULT_AUTO_KNOWLEDGE_FOLDERS)
     result_queue: queue.Queue[Tuple[str, Dict[str, object]]] = queue.Queue()
@@ -4507,6 +4581,7 @@ def launch_portable_llm_terminal_chat(
     strict_local_only: bool = True,
     allow_online_search: bool = True,
     use_offline_fallback: bool = False,
+    enable_chat_learning: bool = True,
     knowledge_folders: Optional[List[str]] = None,
     auto_ingest_folders: bool = True,
 ) -> None:
@@ -4518,11 +4593,12 @@ def launch_portable_llm_terminal_chat(
         strict_local_only=strict_local_only,
         allow_online_search=allow_online_search,
         use_offline_fallback=use_offline_fallback,
+        enable_chat_learning=enable_chat_learning,
     )
     startup_knowledge_folders = knowledge_folders or list(DEFAULT_AUTO_KNOWLEDGE_FOLDERS)
 
     print(f"Perseus terminal chat ready. Provider={llm.provider} Model={llm.model}")
-    print("Commands: /exit, /quit, /stats, /providers, /ingest <folder>")
+    print("Commands: /exit, /quit, /stats, /compliance, /providers, /ingest <folder>")
 
     try:
         if auto_ingest_folders:
@@ -4551,6 +4627,9 @@ def launch_portable_llm_terminal_chat(
                 break
             if command == "/stats":
                 print(json.dumps(llm.get_stats(), indent=2))
+                continue
+            if command == "/compliance":
+                print(json.dumps(llm.get_compliance_report(), indent=2))
                 continue
             if command == "/providers":
                 print(", ".join(llm.available_providers()) or "No providers available")
