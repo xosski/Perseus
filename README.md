@@ -1,26 +1,67 @@
-# Portable LLM Module
+# Perseus Portable LLM
 
-This folder provides a standard, portable LLM layer built using the existing Hades architecture.
+Perseus is a local-first LLM workspace built around `portable_llm.py`, `cli.py`, and the dynamically loaded modules in `Modules/`. It prefers local execution through Ollama, learned local knowledge, and persistent memory databases before using any optional fallback path.
 
 ## What It Uses
 
-- `llm_conversation_core.ConversationManager` when available, with a built-in local conversation manager fallback
-- `ollama` as the default strict local-only generation backend
-- A built-in local knowledge response path that keeps the app focused on learned sources when a generative model is not active
-- `offline_llm.OfflineLLM` as an optional enhanced fallback path only when installed and explicitly enabled
-- Online search augmentation for explicit/current-information questions, while still keeping the LLM provider local by default
+- `portable_llm.PortableLLM` as the main orchestration layer
+- `llm_conversation_core.ConversationManager` for persisted conversations, with a built-in fallback manager when needed
+- Ollama as the default local generation backend
+- Built-in local knowledge and grounded fallback responses when a generative model is not available
+- `offline_llm.OfflineLLM` only as an optional non-strict fallback when installed and explicitly enabled
+- Online search augmentation for explicit/current-information requests, while keeping model execution local by default
+- A dynamic `Modules/` loader that imports Python-compatible `.py`, `.txt`, and extensionless module files without requiring normal package names
+
+## Updated Module Stack
+
+Perseus now includes a broader set of modules under `Modules/`. These modules are loaded at startup when compatible and either contribute hidden prompt context, learning memory, response repair, or provider/search support.
+
+| Module | Main class/functions | Purpose |
+| --- | --- | --- |
+| `Brain State.py` | `BrainStateEngine` | Deterministic cognitive control state: attention, uncertainty, active goal, focus terms, response strategy, and post-response lessons. |
+| `English Language.py` | `EnglishLanguageModule` | Pre-response English comprehension pass for task type, ambiguity, constraints, tone, entities, and expected answer shape. |
+| `Coding Module.py` | `CodingModule`, `build_prompt_context()`, `analyze()` | Coding-assistant context for debug/refactor/create/review/security/test requests, plus local coding lesson storage. |
+| `Search Augmentation.py` | `SearchAugmentation` | Decides when current online information is needed, queries configured providers/fallbacks, and caches search results in SQLite. |
+| `Predictive learning.py` | `PredictiveLearningMemory` | Stores events, patterns, outcomes, and lessons so future prompts can retrieve relevant predictive context. |
+| `Asyncronous Learning.py` | `EchoWiringMemory` | Predictive/asynchronous memory layer with AMM/EchoWiring fields and consent safeguards. |
+| `Cognitive Functions.py` | `GhostCoreCognitiveEngine` | Inspectable cognitive-memory layer that stores memory traces, claims, assumptions, risks, and self-model updates. |
+| `Introspective Learning.py` | `IntrospectiveLearning` | Post-response critique and repair layer that catches weak answers, scaffold leakage, and internal reasoning exposure. |
+| `Autonomous Training.py` | `AutonomousTrainingMemory` | Captures high-quality interactions as candidate supervised-training examples and exports clean JSONL datasets. |
+| `Monday personality.py` | `build_monday_prompt()` | Optional Monday-style personality prompt builder. |
+| `Monday Cook.py` | `build_monday_prompt()`, `build_task_wrapper()` | Alternate Monday prompt/wrapper helpers and example message formatting. |
+| `Perseus_Memory_Orchestrator.py` | `PerseusMemoryOrchestrator` | Reference/optional local-first orchestration wrapper for brain state, EchoWiring, introspection, and autonomous training. |
+
+### Module Persistence
+
+The modules store their local state in SQLite databases beside the code by default:
+
+- `llm_portable_conversations.db` - conversations
+- `llm_web_learning.db` - ingested web/local/chat knowledge
+- `llm_search_cache.db` - online search cache
+- `llm_self_improvement.db` - self-improvement episodes
+- `brain_state_memory.db` - deterministic brain-state snapshots/transitions
+- `predictive_learning_memory.db` - predictive learning events and patterns
+- `ghostcore_echowiring_memory.db` - EchoWiring/asynchronous memory
+- `ghostcore_cognitive_state.db` - cognitive traces and snapshots
+- `introspective_learning.db` - critique/repair traces
+- `perseus_autonomous_training.db` - accepted/rejected training examples and model-candidate metadata
 
 ## Response Sophistication
 
 - Intent profiling for each prompt (`technical`, `educational`, `strategic`, `analytical`, `feedback`)
+- English-language pre-analysis before retrieval and generation
+- Deterministic brain-state planning that tracks active goal, focus terms, uncertainty policy, and response strategy
 - Question decomposition that privately evaluates relevant `who`, `what`, `when`, `where`, `why`, and `how` dimensions before answering
+- Dynamic module context injection from compatible `Modules/` files
+- Predictive, asynchronous, and cognitive memory lookup before generation
 - Adaptive prompt contracts that favor candid, genuine feedback with clear rationale and next steps without exposing chain-of-thought
 - Response quality scoring that penalizes short, generic, flattering, unstructured, low-rationale, or hidden-reasoning-leak answers
+- Introspective post-response repair when a draft is weak, irrelevant, or leaks internal scaffolding
 - Single-pass response refinement when initial output quality is low
-- Visible-output sanitization strips private reasoning tags, scratchpad sections, and hidden planning before responses are stored, learned from, or returned
-- Strict local-only mode by default (Ollama first, learned-source knowledge response when needed)
+- Visible-output sanitization that strips private reasoning tags, scratchpad sections, and hidden planning before responses are stored, learned from, or returned
+- Strict local-only mode by default: local fallback first, then Ollama as a rescue provider, with remote providers blocked unless non-strict mode is enabled
 - Persistent self-improvement memory that learns from prior quality failures and injects corrective directives
-- Runtime session metrics (`success`, `fallbacks`, `average_quality`, `refinements_used`)
+- Runtime metrics for provider behavior, quality, fallbacks, refinements, module status, and autonomous-training capture
 
 ## Knowledge Learning Behavior
 
@@ -48,9 +89,51 @@ Run terminal chat:
 python cli.py --terminal
 ```
 
+Choose provider explicitly:
+
+```bash
+python cli.py --provider ollama --model llama3.2
+```
+
+Use a custom conversation database:
+
+```bash
+python cli.py --db llm_portable_conversations.db
+```
+
+Disable online search augmentation for a fully offline session:
+
+```bash
+python cli.py --no-online-search
+```
+
+Disable startup folder ingestion:
+
+```bash
+python cli.py --no-auto-ingest-folders
+```
+
+Add one or more startup knowledge folders:
+
+```bash
+python cli.py --knowledge-folder knowledge --knowledge-folder "Princess protocol"
+```
+
+Enable non-strict mode, which allows optional fallback behavior:
+
+```bash
+python cli.py --allow-fallbacks
+```
+
+Enable OfflineLLM fallback. This only works with `--allow-fallbacks`:
+
+```bash
+python cli.py --allow-fallbacks --use-offline-fallback
+```
+
 ## Ollama Setup
 
-Perseus is designed to use Ollama as the default local LLM provider. Ollama must be running **and** at least one model must be installed. If Ollama is running but has no models, Perseus will fall back to its basic local fallback responses.
+Perseus is designed to use Ollama as the default local LLM provider. Ollama must be running and at least one model must be installed. If Ollama is running but has no matching model, Perseus falls back to its local non-generative response paths.
 
 1. Install Ollama from <https://ollama.com/download>.
 2. Start the Ollama server:
@@ -91,48 +174,25 @@ python cli.py --terminal --provider ollama --model qwen2.5:1.5b
 
 ### Ollama Troubleshooting
 
-- `Provider=fallback` means Perseus did not find a usable local Ollama model.
+- `Provider=fallback` means Perseus did not find a usable local Ollama model or used the local deterministic path first.
 - `HTTP Error 404` from Ollama usually means the requested model name is not installed. Run `ollama list`, then pass the exact installed model name with `--model`.
 - If `ollama list` is empty, install a model with `ollama pull llama3.2` or `ollama pull qwen2.5:1.5b`.
 - If Ollama is not reachable, start it with `ollama serve`.
 - In strict local-only mode, remote/cloud providers are blocked, so a missing Ollama model will use the built-in fallback instead of an online LLM.
-- The built-in fallback can answer simple chat and some basic general questions, but full ChatGPT-style arbitrary responses require an installed Ollama model.
-
-Choose provider explicitly:
-
-```bash
-python cli.py --provider ollama --model llama3.2
-```
-
-Enable non-strict mode (allows fallbacks/remotes):
-
-```bash
-python cli.py --allow-fallbacks
-```
-
-Disable online search augmentation if you want a fully offline session:
-
-```bash
-python cli.py --no-online-search
-```
-
-Enable OfflineLLM fallback (only works with `--allow-fallbacks`):
-
-```bash
-python cli.py --allow-fallbacks --use-offline-fallback
-```
+- The built-in fallback can answer simple chat and some grounded learned-knowledge questions, but full ChatGPT-style arbitrary generation requires an installed Ollama model.
 
 ## Python Usage
 
 ```python
-from LLM import PortableLLM
+from Perseus import PortableLLM
 
 llm = PortableLLM()
 reply = llm.ask("Explain SQL injection prevention clearly.")
 print(reply)
 
 # Metadata includes provider, model, quality score, refinement status,
-# and whether ingested web context was used.
+# online-search usage, brain-state metadata, module status, and whether
+# ingested web/local context was used.
 reply, meta = llm.ask_with_metadata("Design a practical appsec roadmap for a startup team.")
 print(meta)
 
@@ -149,8 +209,21 @@ llm.save_source_sites([
 source_result = llm.ingest_source_sites()
 print(source_result)
 
+# Inspect dynamic modules and runtime statistics.
+print(llm.list_loaded_modules())
 print(llm.get_stats())
+
+# Export module-managed state when available.
+print(llm.export_brain_state())
+print(llm.export_training_dataset(format="chatml", limit=5000))
+
 llm.close()
+```
+
+If running from inside this folder instead of importing the package from its parent, use:
+
+```python
+from portable_llm import PortableLLM
 ```
 
 ## Ingestion Notes
@@ -165,13 +238,23 @@ llm.close()
 - Source ingest reports both source success and linked page/article success counts
 - Learned content is stored in `llm_web_learning.db`
 
+## Module Development Notes
+
+- Place dynamic extensions in `Modules/`.
+- `.py`, Python-compatible `.txt`, and extensionless files can be loaded.
+- Files and folders such as `__pycache__`, `.git`, `.venv`, `venv`, `env`, and `node_modules` are skipped.
+- A module can contribute hidden prompt context by exposing a compatible object/function such as `MODULE_INSTANCE`, `build_prompt_context(prompt)`, `get_prompt_context(prompt)`, `get_context(prompt)`, or `analyze(prompt)`.
+- Module context is treated as hidden scaffolding. User-visible responses should not mention raw module names, hidden context blocks, chain-of-thought, scratchpads, or internal reasoning unless the user explicitly asks to inspect modules.
+- `Perseus_Memory_Orchestrator.py` is useful as a reference/optional wrapper, but `portable_llm.py` already performs the main orchestration internally.
+
 ## Portability Notes
 
-- Defaults to strict local-only mode and prefers a local provider (`ollama`)
-- Online search is enabled by default for explicit or current-information lookup requests; use `--no-online-search` to disable it
+- Defaults to strict local-only mode and prefers local execution
+- Online search is enabled by default only for explicit or current-information lookup requests; use `--no-online-search` to disable it
 - If a generative model is not active, the built-in local path keeps the app centered on ingested knowledge instead of web browsing
 - In strict mode, remote providers are blocked and provider switching is limited to local providers
-- If local provider output is weak, one refinement pass is attempted before returning best local result
+- If local provider output is weak, introspective repair and one refinement pass may be attempted before returning the best local result
 - Optional non-strict behavior is available via CLI flags when you intentionally want fallback behavior
 - Stores chat history in `llm_portable_conversations.db` by default
 - Stores self-improvement episodes in `llm_self_improvement.db` to guide future prompting
+- Stores module-specific learning state in the SQLite databases listed above
