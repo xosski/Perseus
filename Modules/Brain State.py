@@ -90,7 +90,7 @@ class BrainStateEngine:
     Deterministic state machine.
 
     F(state_t, input_t) consists of:
-    1. parse input signals
+    1. accept the parser channel packet and normalize input signals
     2. update control variables
     3. update working memory
     4. plan a response action
@@ -202,7 +202,7 @@ class BrainStateEngine:
     # -------------------------
 
     def F(self, brain_state_t: BrainState, input_t: str, profile: Optional[Dict] = None) -> Tuple[BrainState, BrainAction]:
-        """Update brain based on past state and present input."""
+        """Update brain based on past state, present input, and the parser channel packet."""
         signals = self.parse_input(input_t, profile=profile)
         updated_state = self.memory_update(brain_state_t, input_t, signals)
         action = self.plan_response(updated_state, signals)
@@ -279,6 +279,35 @@ class BrainStateEngine:
             f"{constraints}\n"
         )
 
+    def build_logic_packet(self, action: Optional[BrainAction] = None) -> Dict:
+        """
+        Build the brain-state packet used by tri-channel final logic control.
+
+        This is machine-readable control data, not user-visible prose.
+        """
+        state = self.brain_state
+        action = action or self.plan_response(state, {})
+        return {
+            "active_intent": state.active_intent,
+            "active_goal": state.active_goal,
+            "active_topic": state.active_topic,
+            "focus_terms": list(action.focus_terms[:8]),
+            "control_state": {
+                "attention": round(state.attention, 2),
+                "confidence": round(state.confidence, 2),
+                "uncertainty": round(state.uncertainty, 2),
+                "caution": round(state.caution, 2),
+                "directness": round(state.directness, 2),
+            },
+            "action": asdict(action),
+            "logic_controls": [
+                "honor the parser channel's intent and requested answer shape",
+                "use this state packet to choose tone, retrieval posture, caveats, and constraints",
+                "send only the assembled answer to the user",
+            ],
+            "update_count": state.update_count,
+        }
+
     def export_state(self) -> Dict:
         return asdict(self.brain_state)
 
@@ -320,22 +349,24 @@ class BrainStateEngine:
         text = re.sub(r"\s+", " ", input_text or "").strip()
         lower = text.lower()
         profile = profile or {}
+        parser_packet = profile.get("parser_packet") if isinstance(profile.get("parser_packet"), dict) else {}
 
         words = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", lower)
         unique_words = list(dict.fromkeys(words))
         length = len(words)
 
-        intent = str(profile.get("intent") or self._infer_intent(lower))
-        complexity = str(profile.get("complexity") or self._infer_complexity(length, lower))
+        intent = str(parser_packet.get("intent") or profile.get("intent") or self._infer_intent(lower))
+        complexity = str(parser_packet.get("complexity") or profile.get("complexity") or self._infer_complexity(length, lower))
 
-        question = "?" in text or lower.startswith(("what", "why", "how", "when", "where", "who", "can", "could", "would", "is", "are", "do", "does"))
-        coding = any(x in lower for x in ["code", "python", "script", "traceback", "error", "module", "function", "class"])
-        creative = any(x in lower for x in ["draw", "image", "story", "lore", "design", "variant"])
-        safety = any(x in lower for x in ["hurt", "kill", "weapon", "exploit", "malware", "bypass", "steal", "password"])
-        current = any(x in lower for x in ["latest", "current", "today", "news", "price", "version", "ceo", "schedule"])
+        question = bool(parser_packet.get("question")) if "question" in parser_packet else "?" in text or lower.startswith(("what", "why", "how", "when", "where", "who", "can", "could", "would", "is", "are", "do", "does"))
+        coding = bool(parser_packet.get("coding")) if "coding" in parser_packet else any(x in lower for x in ["code", "python", "script", "traceback", "error", "module", "function", "class"])
+        creative = bool(parser_packet.get("creative")) if "creative" in parser_packet else any(x in lower for x in ["draw", "image", "story", "lore", "design", "variant"])
+        safety = bool(parser_packet.get("safety")) if "safety" in parser_packet else any(x in lower for x in ["hurt", "kill", "weapon", "exploit", "malware", "bypass", "steal", "password"])
+        current = bool(parser_packet.get("current")) if "current" in parser_packet else any(x in lower for x in ["latest", "current", "today", "news", "price", "version", "ceo", "schedule"])
         emotional = any(x in lower for x in ["tired", "sad", "angry", "worried", "scared", "stressed", "how are you"])
 
-        focus_terms = [
+        parser_focus_terms = [str(term) for term in parser_packet.get("focus_terms", []) if str(term).strip()]
+        focus_terms = parser_focus_terms[:12] or [
             w for w in unique_words
             if w not in {
                 "the", "and", "for", "with", "that", "this", "you", "can", "get",
@@ -347,6 +378,7 @@ class BrainStateEngine:
         return {
             "intent": intent,
             "complexity": complexity,
+            "expected_shape": parser_packet.get("expected_shape") or profile.get("expected_shape"),
             "length": length,
             "question": question,
             "coding": coding,
@@ -355,6 +387,7 @@ class BrainStateEngine:
             "current": current,
             "emotional": emotional,
             "focus_terms": focus_terms,
+            "parser_channel": {k: v for k, v in parser_packet.items() if k != "user_request"},
             "raw": text,
         }
 
