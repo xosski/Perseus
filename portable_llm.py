@@ -2105,6 +2105,26 @@ class PortableLLM:
         """Return the local Modules folder used for dynamic Python-style extensions."""
         return Path(__file__).resolve().parent / MODULES_FOLDER
 
+    def _ensure_modules_import_context(self) -> None:
+        """Expose Modules/ under import names expected by package-style modules."""
+        root = self._modules_root()
+        project_root = root.parent
+
+        for path in (str(project_root), str(root)):
+            if path not in sys.path:
+                sys.path.insert(0, path)
+
+        for package_name in (MODULES_FOLDER, MODULES_FOLDER.lower()):
+            package = sys.modules.get(package_name)
+            if package is None:
+                package = types.ModuleType(package_name)
+                package.__file__ = str(root / "__init__.py")
+                package.__path__ = [str(root)]
+                package.__package__ = package_name
+                sys.modules[package_name] = package
+            elif not hasattr(package, "__path__"):
+                package.__path__ = [str(root)]
+
     @staticmethod
     def _safe_module_name_from_path(path: Path) -> str:
         """Create a deterministic import-safe module name for an arbitrary file path."""
@@ -2118,6 +2138,8 @@ class PortableLLM:
         if not path.is_file():
             return False
         if any(part in MODULE_SKIP_DIR_NAMES for part in path.parts):
+            return False
+        if path.name == "__init__.py":
             return False
         if path.name.startswith("."):
             return False
@@ -2174,9 +2196,10 @@ class PortableLLM:
         record["module_name"] = module_name
 
         try:
+            self._ensure_modules_import_context()
             module = types.ModuleType(module_name)
             module.__file__ = str(resolved)
-            module.__package__ = ""
+            module.__package__ = MODULES_FOLDER
             module.__dict__.setdefault("MODULE_FILE", str(resolved))
             module.__dict__.setdefault("MODULES_ROOT", str(self._modules_root()))
             sys.modules[module_name] = module
