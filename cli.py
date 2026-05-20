@@ -66,6 +66,11 @@ def run() -> int:
         help="Print local growth-learning memory, contradiction, and benchmark stats and exit",
     )
     parser.add_argument(
+        "--modules-report",
+        action="store_true",
+        help="Print dynamic Modules/ load and integration diagnostics and exit",
+    )
+    parser.add_argument(
         "--experience-replay",
         type=int,
         default=0,
@@ -81,7 +86,13 @@ def run() -> int:
     )
     args = parser.parse_args()
 
-    if args.compliance_report or args.growth_report or args.experience_replay or args.run_benchmarks:
+    if (
+        args.compliance_report
+        or args.growth_report
+        or args.modules_report
+        or args.experience_replay
+        or args.run_benchmarks
+    ):
         llm = PortableLLM(
             db_path=args.db,
             provider=args.provider,
@@ -94,6 +105,8 @@ def run() -> int:
         try:
             if args.compliance_report:
                 payload = llm.get_compliance_report()
+            elif args.modules_report:
+                payload = llm.list_loaded_modules()
             elif args.experience_replay:
                 payload = llm.run_experience_replay(limit=args.experience_replay)
             elif args.run_benchmarks:

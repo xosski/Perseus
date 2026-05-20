@@ -509,6 +509,15 @@ DEFAULT_AUTO_KNOWLEDGE_FOLDERS = (DEFAULT_KNOWLEDGE_FOLDER, DEFAULT_PRINCESS_PRO
 MODULES_FOLDER = "Modules"
 MODULE_SCRIPT_EXTENSIONS = {".py", ".pyw", ".txt"}
 MODULE_SKIP_DIR_NAMES = {"__pycache__", ".git", ".venv", "venv", "env", "node_modules"}
+MODULE_DYNAMIC_LOAD_EXCLUDE_FILES = {
+    # AICore is a FastAPI/dashboard application with top-level startup side effects
+    # (prints, API key generation, asset writes). It remains available as a standalone
+    # module, but should not be imported by the chat CLI's prompt-context scanner.
+    "aicore.py",
+    # ai_dashboard is also a standalone Flask/SocketIO app; importing it initializes
+    # app state and attempts optional HadesAI wiring that is unrelated to chat prompts.
+    "ai_dashboard.py",
+}
 PREDICTIVE_LEARNING_MODULE_FILE = "Predictive learning.py"
 PREDICTIVE_LEARNING_MODULE_FALLBACK_FILE = "Predictive learning.txt"
 ASYNCHRONOUS_LEARNING_MODULE_FILE = "Asyncronous Learning.py"
@@ -2141,9 +2150,11 @@ class PortableLLM:
             return False
         if path.name == "__init__.py":
             return False
+        if path.name.lower() in MODULE_DYNAMIC_LOAD_EXCLUDE_FILES:
+            return False
         if path.name.startswith("."):
             return False
-        return path.suffix.lower() in MODULE_SCRIPT_EXTENSIONS
+        return path.suffix.lower() in MODULE_SCRIPT_EXTENSIONS or path.suffix == ""
 
     @staticmethod
     def _read_module_source(path: Path) -> str:
@@ -2422,17 +2433,30 @@ class PortableLLM:
 
     def list_loaded_modules(self) -> Dict[str, object]:
         """Return loaded/skipped module diagnostics for UI or debugging."""
+        dynamic_engines = getattr(self, "dynamic_module_engines", {}) or {}
         return {
             "modules_folder": str(self._modules_root()),
             "loaded_count": sum(1 for item in self.module_load_report if item.get("loaded")),
             "skipped_count": sum(1 for item in self.module_load_report if not item.get("loaded")),
-            "dynamic_engine_count": len(getattr(self, "dynamic_module_engines", {}) or {}),
+            "dynamic_engine_count": len(dynamic_engines),
+            "dynamic_engines": sorted(dynamic_engines),
+            "integrations": {
+                "predictive_learning": bool(getattr(self, "predictive_memory", None)),
+                "asynchronous_echowiring": bool(getattr(self, "echowiring_memory", None)),
+                "cognitive_functions": bool(getattr(self, "cognitive_engine", None)),
+                "brain_state": bool(getattr(self, "brain_state_engine", None)),
+                "search_augmentation": bool(getattr(self, "search_augmentation", None)),
+                "english_language": bool(getattr(self, "english_language_engine", None)),
+                "autonomous_training": bool(getattr(self, "autonomous_trainer", None)),
+                "introspective_learning": bool(getattr(self, "introspective_learning", None)),
+            },
+            "excluded_modules": sorted(MODULE_DYNAMIC_LOAD_EXCLUDE_FILES),
             "loaded_modules": [
                 {
                     "name": item.get("name"),
                     "path": item.get("path"),
                     "module_name": item.get("module_name"),
-                    "engine_enabled": item.get("name") in (getattr(self, "dynamic_module_engines", {}) or {}),
+                    "engine_enabled": item.get("name") in dynamic_engines,
                 }
                 for item in self.module_load_report
                 if item.get("loaded")
