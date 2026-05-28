@@ -1012,7 +1012,13 @@ class BasicSearchAugmentation:
                 """
             )
 
-    def should_search(self, prompt: str, local_context: str = "") -> SearchDecision:
+    def should_search(
+        self,
+        prompt: str,
+        local_context: str = "",
+        draft_response: str = "",
+        quality_score: Optional[int] = None,
+    ) -> SearchDecision:
         if not self.allow_network:
             return SearchDecision(False, "Network search disabled")
         if _is_small_talk_prompt(prompt) or _is_capability_prompt(prompt):
@@ -1020,6 +1026,7 @@ class BasicSearchAugmentation:
 
         text = _extract_user_request(prompt)
         lower = re.sub(r"\s+", " ", text.lower()).strip()
+        draft_lower = (draft_response or "").lower()
 
         explicit_lookup = any(
             marker in lower
@@ -1027,9 +1034,14 @@ class BasicSearchAugmentation:
                 "search online",
                 "look online",
                 "look it up",
+                "lookup",
                 "google",
                 "browse",
                 "web search",
+                "internet",
+                "online",
+                "research this",
+                "find information",
                 "latest",
                 "current",
                 "today",
@@ -1042,11 +1054,27 @@ class BasicSearchAugmentation:
                 "schedule",
                 "release date",
                 "version",
+                "documentation",
+                "changelog",
+                "breaking",
                 "who is the current",
             ]
         )
         if explicit_lookup:
             return SearchDecision(True, "Prompt requests current or online information")
+
+        if quality_score is not None and int(quality_score) < 60:
+            return SearchDecision(True, "Draft quality is low; online lookup may repair missing facts")
+
+        if any(marker in draft_lower for marker in [
+            "i do not have enough",
+            "i don't have enough",
+            "not enough learned context",
+            "cannot answer with confidence",
+            "verify against a primary source",
+            "current information",
+        ]):
+            return SearchDecision(True, "Draft admits insufficient knowledge")
 
         if local_context and len(local_context) > 250:
             return SearchDecision(False, "Relevant local context is available")
@@ -1099,9 +1127,39 @@ class BasicSearchAugmentation:
         if not results:
             return ""
 
+        results = self._enrich_lookup_results(results[:max_results], timeout=timeout)
         context = _format_online_search_context(results[:max_results], query=query)
         self._set_cached(cache_key, query, context)
         return context
+
+    def _enrich_lookup_results(self, results: List[Dict[str, str]], timeout: int = 12) -> List[Dict[str, str]]:
+        """Fetch top pages so fallback search has source content, not just result snippets."""
+        enriched: List[Dict[str, str]] = []
+        for index, item in enumerate(results):
+            if index >= 2:
+                enriched.append(item)
+                continue
+            url = item.get("url", "")
+            parsed = urlparse(url or "")
+            if parsed.scheme not in {"http", "https"}:
+                enriched.append(item)
+                continue
+            try:
+                payload = fetch_url_text(url, timeout=timeout)
+                excerpt = _shorten_lookup_point(payload.get("text", ""), max_chars=900)
+            except Exception:
+                excerpt = ""
+            if excerpt and excerpt.lower() not in (item.get("snippet", "").lower()):
+                richer = dict(item)
+                richer["source"] = f"{richer.get('source', 'online')}+page"
+                richer["snippet"] = _shorten_lookup_point(
+                    f"{richer.get('snippet', '')} Page excerpt: {excerpt}",
+                    max_chars=1400,
+                )
+                enriched.append(richer)
+            else:
+                enriched.append(item)
+        return enriched
 
     def _get_cached(self, cache_key: str) -> str:
         try:
@@ -2874,6 +2932,27 @@ class PortableLLM:
             has_context=enriched.has_context,
         )
 
+        online_search_retry = False
+        enriched_after_search, search_retry_reason = self._maybe_enrich_prompt_with_online_search_after_draft(
+            enriched=enriched,
+            prompt=prompt,
+            draft_response=response or "",
+            quality=quality,
+        )
+        if enriched_after_search.text != enriched.text:
+            retry_response, retry_provider, retry_quality, retry_refined = self._generate_best_response(
+                enriched_after_search.text,
+                profile,
+                has_context=enriched_after_search.has_context,
+            )
+            if retry_response and retry_quality.score >= quality.score:
+                enriched = enriched_after_search
+                response = retry_response
+                provider_used = retry_provider
+                quality = retry_quality
+                refined = bool(refined or retry_refined)
+                online_search_retry = True
+
         used_offline = False
         if not response and self.offline:
             used_offline = True
@@ -3011,6 +3090,14 @@ class PortableLLM:
                     context_preview=enriched.context_preview,
                     refined=refined,
                 )
+                self._learn_from_ollama_reference(
+                    prompt=prompt,
+                    final_response=str(response),
+                    profile=profile,
+                    provider=provider_used,
+                    quality=quality,
+                    context_preview=enriched.context_preview,
+                )
 
             metadata = {
                 "provider": provider_used,
@@ -3023,6 +3110,8 @@ class PortableLLM:
                 "complexity": profile.complexity,
                 "grounded_with_ingested_context": enriched.has_context,
                 "context_preview": enriched.context_preview,
+                "online_search_retry": online_search_retry,
+                "online_search_retry_reason": search_retry_reason,
                 "strict_local_only": self.strict_local_only,
                 "chat_learning_enabled": self.enable_chat_learning,
                 "tri_channel_logic": {
@@ -3548,6 +3637,86 @@ class PortableLLM:
             )
         except Exception as exc:
             logger.warning("Autonomous training capture failed: %s", exc)
+
+    def _learn_from_ollama_reference(
+        self,
+        prompt: str,
+        final_response: str,
+        profile: PromptProfile,
+        provider: str,
+        quality: ResponseQuality,
+        context_preview: str = "",
+    ) -> None:
+        """Use local Ollama as a quiet teacher for the non-Ollama path."""
+        if provider == "ollama" or not getattr(self, "growth_store", None):
+            return
+        ollama = self.manager.providers.get("ollama") if getattr(self, "manager", None) else None
+        if not ollama or not getattr(ollama, "available", False):
+            return
+
+        mentor_prompt = (
+            "You are a local Ollama mentor helping Perseus improve future answers. "
+            "Do not reveal hidden reasoning. Return exactly two concise bullets: "
+            "one durable response-quality lesson and one concrete factual/style improvement if needed.\n\n"
+            f"User prompt:\n{prompt[:1500]}\n\n"
+            f"Final Perseus response:\n{final_response[:1800]}\n\n"
+            f"Quality score: {quality.score}; reasons: {'; '.join((quality.reasons or [])[:5])}\n"
+            f"Context preview, if any:\n{context_preview[:1000]}"
+        )
+        try:
+            mentor_response = self._generate_with_provider(
+                "ollama",
+                mentor_prompt,
+                profile,
+                refine=False,
+                prior_response=None,
+            )
+        except Exception as exc:
+            logger.warning("Ollama mentor learning failed: %s", exc)
+            return
+
+        mentor_response = _sanitize_visible_response(mentor_response or "", prompt_payload=mentor_prompt)
+        if not mentor_response:
+            return
+
+        bullets = [
+            re.sub(r"^\s*[-*•\d.)]+\s*", "", line).strip()
+            for line in mentor_response.splitlines()
+            if line.strip()
+        ]
+        learned = 0
+        evidence = (
+            f"Ollama mentor after provider={provider}; intent={profile.intent}; "
+            f"quality={quality.score}; prompt={prompt[:300]}"
+        )
+        for bullet in bullets[:2]:
+            if len(bullet) < 12 or _contains_internal_reasoning_leak(bullet):
+                continue
+            lesson = f"Ollama reference guidance for {profile.intent} prompts: {bullet}"
+            try:
+                if self.growth_store.record_lesson(
+                    lesson=lesson,
+                    evidence=evidence,
+                    confidence=max(0.55, min(0.92, quality.score / 100.0)),
+                    source="ollama_reference",
+                ):
+                    learned += 1
+            except Exception as exc:
+                logger.warning("Ollama reference lesson write failed: %s", exc)
+                break
+
+        if learned:
+            try:
+                self.improvement_store.record(
+                    intent=profile.intent,
+                    quality_score=max(quality.score, 80),
+                    quality_reasons=["Ollama reference learning captured"],
+                    was_refined=True,
+                    used_context=bool(context_preview),
+                    response_chars=len(final_response or ""),
+                )
+            except Exception:
+                pass
 
     @staticmethod
     def _memory_categories(memories: List[str]) -> List[str]:
@@ -4160,6 +4329,78 @@ class PortableLLM:
         ]
         return EnrichedPrompt(text=enriched_text, has_context=True, context_preview=" | ".join(preview_parts))
 
+    def _maybe_enrich_prompt_with_online_search_after_draft(
+        self,
+        enriched: EnrichedPrompt,
+        prompt: str,
+        draft_response: str,
+        quality: ResponseQuality,
+    ) -> Tuple[EnrichedPrompt, str]:
+        """Run a second lookup pass when the first draft exposes missing/current facts."""
+        searcher = getattr(self, "search_augmentation", None)
+        if not searcher or not draft_response:
+            return enriched, ""
+        if "ONLINE SEARCH CONTEXT" in (enriched.text or ""):
+            return enriched, ""
+        if _is_small_talk_prompt(prompt) or _is_capability_prompt(prompt):
+            return enriched, ""
+
+        try:
+            decision = searcher.should_search(
+                prompt,
+                local_context=enriched.context_preview,
+                draft_response=draft_response,
+                quality_score=quality.score,
+            )
+        except TypeError:
+            try:
+                decision = searcher.should_search(prompt, local_context=enriched.context_preview)
+            except Exception as exc:
+                logger.warning("Second-pass search decision failed: %s", exc)
+                return enriched, ""
+        except Exception as exc:
+            logger.warning("Second-pass search decision failed: %s", exc)
+            return enriched, ""
+
+        if not getattr(decision, "should_search", False):
+            return enriched, ""
+
+        try:
+            search_context = searcher.search_and_build_context(prompt)
+        except Exception as exc:
+            logger.warning("Second-pass online search failed: %s", exc)
+            return enriched, getattr(decision, "reason", "")
+
+        if not search_context:
+            return enriched, getattr(decision, "reason", "")
+
+        enriched_text = (
+            "The first draft was too weak or uncertain, so online lookup was performed. "
+            "Use the search context as private evidence to produce a stronger final answer. "
+            "Do not expose raw snippets, lookup payloads, hidden reasoning, or internal context labels.\n\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_BEGIN\n"
+            f"Search decision: {getattr(decision, 'reason', 'Second-pass lookup')}\n\n"
+            f"{search_context}\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_END\n\n"
+            "Previous weak draft to improve, not repeat verbatim:\n"
+            f"{draft_response[:1200]}\n\n"
+            "Current prompt payload:\n"
+            f"{enriched.text}"
+        )
+        preview_parts = [
+            part
+            for part in [
+                enriched.context_preview,
+                search_context[:1200].replace("\n", " ").strip(),
+            ]
+            if part
+        ]
+        return EnrichedPrompt(
+            text=enriched_text,
+            has_context=True,
+            context_preview=" | ".join(preview_parts)[:2200],
+        ), getattr(decision, "reason", "")
+
     def _build_predictive_module_context(self, prompt: str) -> str:
         """Read predictions/lessons from Predictive, EchoWiring, and Cognitive modules."""
         blocks: List[str] = []
@@ -4744,6 +4985,12 @@ class PortableLLM:
         history = self.conversation.messages[-self._max_history_messages :]
         api_messages: List[Dict[str, str]] = [{"role": "system", "content": system}]
         api_messages.extend({"role": msg.role, "content": msg.content} for msg in history)
+        api_messages.append(
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        )
 
         if refine and prior_response:
             api_messages.append(

@@ -148,10 +148,16 @@ class SearchAugmentation:
 
         explicit_terms = [
             "search the web",
+            "search online",
+            "look online",
             "look up",
             "lookup",
             "google",
             "browse",
+            "internet",
+            "online",
+            "research this",
+            "find information",
             "latest",
             "current",
             "recent",
@@ -200,6 +206,11 @@ class SearchAugmentation:
             "deadline",
             "requirements",
             "api changes",
+            "documentation",
+            "download",
+            "breaking",
+            "announcement",
+            "changelog",
         ]
         if any(term in prompt_lower for term in current_sensitive_terms):
             return SearchDecision(True, "Question may depend on current information.", 0.8)
@@ -263,8 +274,43 @@ class SearchAugmentation:
             results = self._search_duckduckgo_html(query)
 
         cleaned = self._dedupe_results(results)[: self.max_results]
+        cleaned = self._enrich_results_with_page_excerpts(cleaned)
         self._set_cached(query, cleaned)
         return cleaned
+
+    def _enrich_results_with_page_excerpts(self, results: List[SearchResult]) -> List[SearchResult]:
+        """Fetch top result pages so the model gets more than thin search snippets."""
+        enriched: List[SearchResult] = []
+        for index, result in enumerate(results):
+            if index >= 2:
+                enriched.append(result)
+                continue
+            page_text = self._fetch_page_excerpt(result.url)
+            if page_text and page_text.lower() not in (result.snippet or "").lower():
+                snippet = f"{result.snippet} Page excerpt: {page_text}".strip()
+                enriched.append(SearchResult(
+                    title=result.title,
+                    url=result.url,
+                    snippet=snippet[:1600],
+                    source=f"{result.source}+page",
+                    retrieved_utc=result.retrieved_utc,
+                ))
+            else:
+                enriched.append(result)
+        return enriched
+
+    def _fetch_page_excerpt(self, url: str) -> str:
+        parsed = urlparse(url or "")
+        if parsed.scheme not in {"http", "https"}:
+            return ""
+        html = self._request_text(url)
+        if not html:
+            return ""
+        text = re.sub(r"(?is)<(script|style|noscript|svg).*?>.*?</\1>", " ", html)
+        text = self._strip_html(text)
+        # Prefer the beginning of the readable page body; search result pages often
+        # include navigation, but even that is better bounded than raw HTML.
+        return text[:1000].rsplit(" ", 1)[0].strip()
 
     def _request_json(
         self,
