@@ -20,11 +20,13 @@ import ast
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import unescape
+import ipaddress
 import json
 import logging
 from pathlib import Path
 import queue
 import re
+import socket
 import sqlite3
 import sys
 import threading
@@ -39,9 +41,20 @@ import hashlib
 import inspect
 from typing import List, Dict, Optional
 try:
-    from llm_conversation_core import ConversationManager
+    from llm_conversation_core import (
+        ConversationManager,
+        DEFAULT_AZURE_DEPLOYMENT,
+        DEFAULT_MISTRAL_MODEL,
+        DEFAULT_OLLAMA_MODEL,
+        DEFAULT_OPENAI_MODEL,
+    )
     from offline_llm import OfflineLLM
 except ImportError:
+    DEFAULT_AZURE_DEPLOYMENT = "gpt-4o-mini"
+    DEFAULT_MISTRAL_MODEL = "mistral-small-latest"
+    DEFAULT_OLLAMA_MODEL = "llama3.3"
+    DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+
     @dataclass
     class ConversationMessage:
         role: str
@@ -88,7 +101,7 @@ except ImportError:
             self,
             prompt: str,
             messages: Optional[List[Dict[str, str]]] = None,
-            model: str = "llama3.2",
+            model: str = DEFAULT_OLLAMA_MODEL,
             temperature: float = 0.7,
             max_tokens: int = 2048,
         ) -> Optional[str]:
@@ -500,6 +513,12 @@ except ImportError:
 WEB_LEARNING_DB_PATH = "llm_web_learning.db"
 SELF_IMPROVEMENT_DB_PATH = "llm_self_improvement.db"
 GROWTH_LEARNING_DB_PATH = "perseus_growth_learning.db"
+MAX_PROMPT_CHARS = 60000
+MAX_PROVIDER_TOKENS = 8192
+MAX_FETCH_TIMEOUT_SECONDS = 60
+MAX_FETCH_BYTES = 2_000_000
+ALLOWED_FETCH_SCHEMES = {"http", "https"}
+BLOCKED_FETCH_HOSTNAMES = {"localhost", "localhost.localdomain"}
 MONDAY_PERSONALITY_FILE = "Monday personality.py"
 MONDAY_PERSONALITY_FALLBACK_FILE = "Monday personality.txt"
 OLLAMA_SMART_CONTENT_FILE = "Ollama smart content.txt"
@@ -2872,12 +2891,17 @@ class PortableLLM:
             return "Please provide a prompt.", {"error": "empty_prompt"}
 
         prompt = prompt.strip()
+        if len(prompt) > MAX_PROMPT_CHARS:
+            return (
+                f"Prompt is too large ({len(prompt)} characters). Please keep requests under {MAX_PROMPT_CHARS} characters.",
+                {"error": "prompt_too_large", "max_prompt_chars": MAX_PROMPT_CHARS},
+            )
         self.stats.total_requests += 1
 
         if temperature is not None:
-            self.conversation.temperature = float(temperature)
+            self.conversation.temperature = _clamp_float(temperature, self.conversation.temperature, 0.0, 2.0)
         if max_tokens is not None:
-            self.conversation.max_tokens = int(max_tokens)
+            self.conversation.max_tokens = _clamp_int(max_tokens, self.conversation.max_tokens, 1, MAX_PROVIDER_TOKENS)
 
         profile = self._profile_prompt(prompt)
         parser_packet = self._build_parser_packet(prompt, profile)
@@ -5195,10 +5219,10 @@ class PortableLLM:
     @staticmethod
     def _default_model_for(provider: str) -> str:
         model_map = {
-            "openai": "gpt-3.5-turbo",
-            "mistral": "mistral-tiny",
-            "ollama": "llama3.2",
-            "azure": "gpt-35-turbo",
+            "openai": DEFAULT_OPENAI_MODEL,
+            "mistral": DEFAULT_MISTRAL_MODEL,
+            "ollama": DEFAULT_OLLAMA_MODEL,
+            "azure": DEFAULT_AZURE_DEPLOYMENT,
             "fallback": "fallback",
             "offline": "offline",
         }
@@ -6621,6 +6645,61 @@ def _extract_title(html: str) -> str:
     return unescape(match.group(1)).strip()
 
 
+def _clamp_int(value: object, default: int, lower: int, upper: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lower, min(upper, parsed))
+
+
+def _clamp_float(value: object, default: float, lower: float, upper: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lower, min(upper, parsed))
+
+
+def _is_blocked_address(address: str) -> bool:
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return True
+    return any(
+        (
+            parsed.is_private,
+            parsed.is_loopback,
+            parsed.is_link_local,
+            parsed.is_multicast,
+            parsed.is_reserved,
+            parsed.is_unspecified,
+        )
+    )
+
+
+def _validate_fetch_url(url: str) -> str:
+    """Allow only public HTTP(S) URLs for knowledge ingestion."""
+    candidate = (url or "").strip()
+    parsed = urlparse(candidate)
+    if parsed.scheme.lower() not in ALLOWED_FETCH_SCHEMES:
+        raise RuntimeError("Only http:// and https:// URLs can be ingested")
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not hostname:
+        raise RuntimeError("URL is missing a hostname")
+    if hostname in BLOCKED_FETCH_HOSTNAMES:
+        raise RuntimeError("Refusing to fetch local hostnames")
+
+    try:
+        addresses = {info[4][0] for info in socket.getaddrinfo(hostname, parsed.port or 443, type=socket.SOCK_STREAM)}
+    except socket.gaierror as exc:
+        raise RuntimeError(f"Unable to resolve URL hostname: {exc}") from exc
+
+    if not addresses or any(_is_blocked_address(address) for address in addresses):
+        raise RuntimeError("Refusing to fetch local, private, or otherwise non-public network addresses")
+    return candidate
+
+
 def fetch_url_text(url: str, timeout: int = 15) -> Dict[str, str]:
     """Fetch URL and return extracted title + plain text."""
     payload = fetch_url_payload(url, timeout=timeout)
@@ -6629,6 +6708,8 @@ def fetch_url_text(url: str, timeout: int = 15) -> Dict[str, str]:
 
 def fetch_url_payload(url: str, timeout: int = 15) -> Dict[str, str]:
     """Fetch URL and return raw body plus extracted title/text."""
+    url = _validate_fetch_url(url)
+    timeout = _clamp_int(timeout, 15, 1, MAX_FETCH_TIMEOUT_SECONDS)
     req = Request(
         url,
         headers={
@@ -6642,9 +6723,14 @@ def fetch_url_payload(url: str, timeout: int = 15) -> Dict[str, str]:
 
     try:
         with urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            charset = "utf-8"
+            final_url = _validate_fetch_url(resp.geturl() or url)
             content_type = resp.headers.get("Content-Type", "")
+            if content_type and not re.search(r"(?i)(text/|application/(rss|atom|xml|xhtml\+xml|json))", content_type):
+                raise RuntimeError(f"Unsupported content type for ingestion: {content_type}")
+            raw = resp.read(MAX_FETCH_BYTES + 1)
+            if len(raw) > MAX_FETCH_BYTES:
+                raise RuntimeError(f"Fetched content exceeds {MAX_FETCH_BYTES} byte limit")
+            charset = "utf-8"
             charset_match = re.search(r"charset=([\w-]+)", content_type)
             if charset_match:
                 charset = charset_match.group(1)
@@ -6658,7 +6744,7 @@ def fetch_url_payload(url: str, timeout: int = 15) -> Dict[str, str]:
     if not text:
         raise RuntimeError("Fetched page but extracted empty text")
 
-    return {"title": title, "text": text, "raw": html, "content_type": content_type}
+    return {"title": title, "text": text, "raw": html, "content_type": content_type, "url": final_url}
 
 
 def _extract_feed_links(raw_text: str, base_url: str) -> List[str]:

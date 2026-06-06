@@ -19,6 +19,49 @@ from abc import ABC, abstractmethod
 
 logger = logging.getLogger("LLMConversation")
 
+DEFAULT_OPENAI_MODEL = os.getenv("PERSEUS_OPENAI_MODEL", "gpt-4o-mini")
+DEFAULT_MISTRAL_MODEL = os.getenv("PERSEUS_MISTRAL_MODEL", "mistral-small-latest")
+DEFAULT_OLLAMA_MODEL = os.getenv("PERSEUS_OLLAMA_MODEL", "llama3.3")
+DEFAULT_AZURE_DEPLOYMENT = os.getenv("PERSEUS_AZURE_DEPLOYMENT", "gpt-4o-mini")
+MAX_PROVIDER_TOKENS = 8192
+
+
+def _clamp_float(value: Any, default: float, lower: float, upper: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lower, min(upper, parsed))
+
+
+def _clamp_int(value: Any, default: int, lower: int, upper: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lower, min(upper, parsed))
+
+
+def _safe_generation_options(kwargs: Dict[str, Any], default_tokens: int = 2000) -> Dict[str, Any]:
+    return {
+        "temperature": _clamp_float(kwargs.get("temperature", 0.7), 0.7, 0.0, 2.0),
+        "max_tokens": _clamp_int(kwargs.get("max_tokens", default_tokens), default_tokens, 1, MAX_PROVIDER_TOKENS),
+        "timeout": _clamp_int(kwargs.get("timeout", 30), 30, 5, 300),
+    }
+
+
+def _safe_messages(messages: Optional[List[Dict[str, Any]]], prompt: str) -> List[Dict[str, str]]:
+    source = messages or [{"role": "user", "content": prompt}]
+    safe: List[Dict[str, str]] = []
+    allowed_roles = {"system", "user", "assistant", "tool"}
+    for message in source:
+        role = str((message or {}).get("role") or "user").lower()
+        if role not in allowed_roles:
+            role = "user"
+        content = str((message or {}).get("content") or "")
+        safe.append({"role": role, "content": content})
+    return safe
+
 # ============================================================================
 # DATA MODELS
 # ============================================================================
@@ -58,7 +101,7 @@ class Conversation:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     provider: str = "openai"
-    model: str = "gpt-3.5-turbo"
+    model: str = DEFAULT_OPENAI_MODEL
     temperature: float = 0.7
     max_tokens: int = 2000
     system_prompt: Optional[str] = None
@@ -149,13 +192,14 @@ class OpenAIProvider(LLMProviderBase):
             return None
         
         try:
-            messages = kwargs.get("messages") or [{"role": "user", "content": prompt}]
+            options = _safe_generation_options(kwargs)
+            messages = _safe_messages(kwargs.get("messages"), prompt)
             response = self.client.chat.completions.create(
-                model=kwargs.get("model", "gpt-3.5-turbo"),
+                model=kwargs.get("model", DEFAULT_OPENAI_MODEL),
                 messages=messages,
-                max_tokens=kwargs.get("max_tokens", 2000),
-                temperature=kwargs.get("temperature", 0.7),
-                timeout=kwargs.get("timeout", 30)
+                max_tokens=options["max_tokens"],
+                temperature=options["temperature"],
+                timeout=options["timeout"]
             )
             return response.choices[0].message.content
         except Exception as e:
@@ -167,14 +211,15 @@ class OpenAIProvider(LLMProviderBase):
             return
         
         try:
-            messages = kwargs.get("messages") or [{"role": "user", "content": prompt}]
+            options = _safe_generation_options(kwargs)
+            messages = _safe_messages(kwargs.get("messages"), prompt)
             stream = self.client.chat.completions.create(
-                model=kwargs.get("model", "gpt-3.5-turbo"),
+                model=kwargs.get("model", DEFAULT_OPENAI_MODEL),
                 messages=messages,
-                max_tokens=kwargs.get("max_tokens", 2000),
-                temperature=kwargs.get("temperature", 0.7),
+                max_tokens=options["max_tokens"],
+                temperature=options["temperature"],
                 stream=True,
-                timeout=kwargs.get("timeout", 30)
+                timeout=options["timeout"]
             )
             
             for chunk in stream:
@@ -207,12 +252,13 @@ class MistralProvider(LLMProviderBase):
             return None
         
         try:
-            messages = kwargs.get("messages") or [{"role": "user", "content": prompt}]
+            options = _safe_generation_options(kwargs)
+            messages = _safe_messages(kwargs.get("messages"), prompt)
             response = self.client.chat.complete(
-                model=kwargs.get("model", "mistral-tiny"),
+                model=kwargs.get("model", DEFAULT_MISTRAL_MODEL),
                 messages=messages,
-                max_tokens=kwargs.get("max_tokens", 2000),
-                temperature=kwargs.get("temperature", 0.7)
+                max_tokens=options["max_tokens"],
+                temperature=options["temperature"]
             )
             return response.choices[0].message.content
         except Exception as e:
@@ -224,12 +270,13 @@ class MistralProvider(LLMProviderBase):
             return
         
         try:
-            messages = kwargs.get("messages") or [{"role": "user", "content": prompt}]
+            options = _safe_generation_options(kwargs)
+            messages = _safe_messages(kwargs.get("messages"), prompt)
             stream = self.client.chat.stream(
-                model=kwargs.get("model", "mistral-tiny"),
+                model=kwargs.get("model", DEFAULT_MISTRAL_MODEL),
                 messages=messages,
-                max_tokens=kwargs.get("max_tokens", 2000),
-                temperature=kwargs.get("temperature", 0.7)
+                max_tokens=options["max_tokens"],
+                temperature=options["temperature"]
             )
             
             for chunk in stream:
@@ -245,6 +292,7 @@ class OllamaProvider(LLMProviderBase):
     def __init__(self, base_url: str = "http://localhost:11434"):
         super().__init__("ollama")
         self.base_url = base_url
+        self.installed_models: List[str] = []
         self.available = False
         
         try:
@@ -262,26 +310,51 @@ class OllamaProvider(LLMProviderBase):
             resp = requests.get(f"{self.base_url}/api/tags", timeout=5)
             if resp.status_code != 200:
                 return False
-            return bool((resp.json() or {}).get("models"))
+            models = (resp.json() or {}).get("models") or []
+            self.installed_models = [str(item.get("name") or item.get("model") or "") for item in models if item]
+            return bool(self.installed_models)
         except:
             return False
+
+    def _select_model(self, requested: Optional[str]) -> str:
+        requested = str(requested or DEFAULT_OLLAMA_MODEL).strip() or DEFAULT_OLLAMA_MODEL
+        if not self.installed_models:
+            self._test_ollama()
+        if not self.installed_models or requested in self.installed_models:
+            return requested
+
+        requested_base = requested.split(":", 1)[0]
+        for installed in self.installed_models:
+            if installed.split(":", 1)[0] == requested_base:
+                return installed
+
+        preferred_bases = ("llama3.3", "llama3.2", "qwen3", "qwen2.5", "mistral", "gemma3")
+        for preferred in preferred_bases:
+            for installed in self.installed_models:
+                if installed.split(":", 1)[0] == preferred:
+                    logger.info("Requested Ollama model %s is not installed; using %s", requested, installed)
+                    return installed
+
+        logger.info("Requested Ollama model %s is not installed; using %s", requested, self.installed_models[0])
+        return self.installed_models[0]
     
     def generate(self, prompt: str, **kwargs) -> str:
         if not self.available:
             return None
         
         try:
-            model = kwargs.get("model", "llama3.2")
+            options = _safe_generation_options(kwargs)
+            model = self._select_model(kwargs.get("model", DEFAULT_OLLAMA_MODEL))
             messages = kwargs.get("messages")
 
             if messages:
                 response = self.client.chat(
                     model=model,
-                    messages=messages,
+                    messages=_safe_messages(messages, prompt),
                     stream=False,
                     options={
-                        "temperature": kwargs.get("temperature", 0.7),
-                        "num_predict": kwargs.get("max_tokens", 2000),
+                        "temperature": options["temperature"],
+                        "num_predict": options["max_tokens"],
                         "num_ctx": 8192,
                     }
                 )
@@ -292,8 +365,8 @@ class OllamaProvider(LLMProviderBase):
                 prompt=prompt,
                 stream=False,
                 options={
-                    "temperature": kwargs.get("temperature", 0.7),
-                    "num_predict": kwargs.get("max_tokens", 2000),
+                    "temperature": options["temperature"],
+                    "num_predict": options["max_tokens"],
                     "num_ctx": 8192,
                 }
             )
@@ -307,17 +380,18 @@ class OllamaProvider(LLMProviderBase):
             return
         
         try:
-            model = kwargs.get("model", "llama3.2")
+            options = _safe_generation_options(kwargs)
+            model = self._select_model(kwargs.get("model", DEFAULT_OLLAMA_MODEL))
             messages = kwargs.get("messages")
 
             if messages:
                 stream = self.client.chat(
                     model=model,
-                    messages=messages,
+                    messages=_safe_messages(messages, prompt),
                     stream=True,
                     options={
-                        "temperature": kwargs.get("temperature", 0.7),
-                        "num_predict": kwargs.get("max_tokens", 2000),
+                        "temperature": options["temperature"],
+                        "num_predict": options["max_tokens"],
                         "num_ctx": 8192,
                     }
                 )
@@ -333,8 +407,8 @@ class OllamaProvider(LLMProviderBase):
                 prompt=prompt,
                 stream=True,
                 options={
-                    "temperature": kwargs.get("temperature", 0.7),
-                    "num_predict": kwargs.get("max_tokens", 2000),
+                    "temperature": options["temperature"],
+                    "num_predict": options["max_tokens"],
                     "num_ctx": 8192,
                 }
             )
@@ -374,12 +448,13 @@ class AzureOpenAIProvider(LLMProviderBase):
             return None
         
         try:
-            messages = kwargs.get("messages") or [{"role": "user", "content": prompt}]
+            options = _safe_generation_options(kwargs)
+            messages = _safe_messages(kwargs.get("messages"), prompt)
             response = self.client.chat.completions.create(
-                deployment_name=kwargs.get("deployment", "gpt-35-turbo"),
+                deployment_name=kwargs.get("deployment", DEFAULT_AZURE_DEPLOYMENT),
                 messages=messages,
-                max_tokens=kwargs.get("max_tokens", 2000),
-                temperature=kwargs.get("temperature", 0.7)
+                max_tokens=options["max_tokens"],
+                temperature=options["temperature"]
             )
             return response.choices[0].message.content
         except Exception as e:
@@ -391,12 +466,13 @@ class AzureOpenAIProvider(LLMProviderBase):
             return
         
         try:
-            messages = kwargs.get("messages") or [{"role": "user", "content": prompt}]
+            options = _safe_generation_options(kwargs)
+            messages = _safe_messages(kwargs.get("messages"), prompt)
             stream = self.client.chat.completions.create(
-                deployment_name=kwargs.get("deployment", "gpt-35-turbo"),
+                deployment_name=kwargs.get("deployment", DEFAULT_AZURE_DEPLOYMENT),
                 messages=messages,
-                max_tokens=kwargs.get("max_tokens", 2000),
-                temperature=kwargs.get("temperature", 0.7),
+                max_tokens=options["max_tokens"],
+                temperature=options["temperature"],
                 stream=True
             )
             
@@ -587,10 +663,10 @@ class ConversationManager:
 
     def _default_model_for(self, provider: str) -> str:
         model_map = {
-            "openai": "gpt-3.5-turbo",
-            "mistral": "mistral-small-latest",
-            "ollama": "llama3.2",
-            "azure": "gpt-35-turbo",
+            "openai": DEFAULT_OPENAI_MODEL,
+            "mistral": DEFAULT_MISTRAL_MODEL,
+            "ollama": DEFAULT_OLLAMA_MODEL,
+            "azure": DEFAULT_AZURE_DEPLOYMENT,
             "fallback": "fallback",
         }
         return model_map.get(provider, "fallback")
@@ -641,7 +717,7 @@ class ConversationManager:
         self,
         title: str,
         provider: str = "openai",
-        model: str = "gpt-3.5-turbo",
+        model: str = DEFAULT_OPENAI_MODEL,
         system_prompt: Optional[str] = None,
         **kwargs
     ) -> Conversation:

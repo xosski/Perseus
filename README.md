@@ -92,8 +92,10 @@ python cli.py --terminal
 Choose provider explicitly:
 
 ```bash
-python cli.py --provider ollama --model llama3.2
+python cli.py --provider ollama --model llama3.3
 ```
+
+You can also set default model overrides with environment variables such as `PERSEUS_OLLAMA_MODEL`, `PERSEUS_OPENAI_MODEL`, `PERSEUS_MISTRAL_MODEL`, and `PERSEUS_AZURE_DEPLOYMENT`.
 
 Use a custom conversation database:
 
@@ -175,7 +177,7 @@ ollama serve
 3. In a second terminal, install a model:
 
 ```bash
-ollama pull llama3.2
+ollama pull llama3.3
 ```
 
 If your machine is low on RAM, try a smaller model:
@@ -193,7 +195,7 @@ ollama list
 5. Launch Perseus with the matching model:
 
 ```bash
-python cli.py --terminal --provider ollama --model llama3.2
+python cli.py --terminal --provider ollama --model llama3.3
 ```
 
 or, for the smaller model:
@@ -205,11 +207,18 @@ python cli.py --terminal --provider ollama --model qwen2.5:1.5b
 ### Ollama Troubleshooting
 
 - `Provider=fallback` means Perseus did not find a usable local Ollama model or used the local deterministic path first.
-- `HTTP Error 404` from Ollama usually means the requested model name is not installed. Run `ollama list`, then pass the exact installed model name with `--model`.
-- If `ollama list` is empty, install a model with `ollama pull llama3.2` or `ollama pull qwen2.5:1.5b`.
+- If the requested Ollama model is not installed, Perseus now picks a compatible installed local model when possible instead of immediately failing.
+- `HTTP Error 404` from Ollama usually means the requested model name is not installed and no compatible local fallback was found. Run `ollama list`, then pass the exact installed model name with `--model`.
+- If `ollama list` is empty, install a model with `ollama pull llama3.3` or `ollama pull qwen2.5:1.5b`.
 - If Ollama is not reachable, start it with `ollama serve`.
 - In strict local-only mode, remote/cloud providers are blocked, so a missing Ollama model will use the built-in fallback instead of an online LLM.
 - The built-in fallback can answer simple chat and some grounded learned-knowledge questions, but full ChatGPT-style arbitrary generation requires an installed Ollama model.
+
+### Ingestion Hardening
+
+- URL ingestion only accepts public `http://` and `https://` targets.
+- Localhost, private-network, link-local, multicast, reserved, and oversized responses are rejected.
+- Fetch timeouts and provider generation token limits are clamped to bounded ranges.
 
 ## Python Usage
 
