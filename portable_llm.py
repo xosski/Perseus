@@ -48,7 +48,6 @@ try:
         DEFAULT_OLLAMA_MODEL,
         DEFAULT_OPENAI_MODEL,
     )
-    from offline_llm import OfflineLLM
 except ImportError:
     DEFAULT_AZURE_DEPLOYMENT = "gpt-4o-mini"
     DEFAULT_MISTRAL_MODEL = "mistral-small-latest"
@@ -289,7 +288,12 @@ except ImportError:
                     )
             return True
 
+        def close(self) -> None:
+            self.conn.close()
 
+try:
+    from offline_llm import OfflineLLM
+except ImportError:
     class OfflineLLM:
         """Minimal offline fallback used when the external OfflineLLM module is unavailable."""
 
@@ -543,6 +547,7 @@ ASYNCHRONOUS_LEARNING_MODULE_FILE = "Asyncronous Learning.py"
 ASYNCHRONOUS_LEARNING_MODULE_FALLBACK_FILE = "Asyncronous Learning.txt"
 COGNITIVE_FUNCTIONS_MODULE_FILE = "Cognitive Functions.py"
 COGNITIVE_FUNCTIONS_MODULE_FALLBACK_FILE = "Cognitive Functions.txt"
+COGNITIVE_MEMORY_MODULE_FILE = "cognitive_memory.py"
 BRAIN_STATE_MODULE_FILE = "Brain State.py"
 SEARCH_AUGMENTATION_MODULE_FILE = "Search Augmentation.py"
 ENGLISH_LANGUAGE_MODULE_FILE = "English Language.py"
@@ -1785,13 +1790,19 @@ MEMORY_RETRIEVAL_STOPWORDS = {
     "would",
 }
 SENSITIVE_MEMORY_MARKERS = {
+    "access code",
     "api key",
     "apikey",
     "auth token",
     "bearer token",
+    "credential",
     "credit card",
+    "passcode",
+    "pin code",
     "private key",
     "password",
+    "recovery code",
+    "secret",
     "secret key",
     "seed phrase",
     "ssn",
@@ -2042,6 +2053,7 @@ class PortableLLM:
         self._load_all_script_modules()
         self.improvement_store = SelfImprovementStore()
         self.growth_store = GrowthLearningStore(db_path=self._module_db_path(GROWTH_LEARNING_DB_PATH))
+        self.cognitive_memory = self._create_cognitive_memory(db_path)
         self.predictive_memory = self._create_predictive_memory()
         self.echowiring_memory = self._create_echowiring_memory()
         self.cognitive_engine = self._create_cognitive_engine()
@@ -2508,6 +2520,45 @@ class PortableLLM:
         ]
         return EnrichedPrompt(text=enriched_text, has_context=True, context_preview=" | ".join(preview_parts)[:1800])
 
+    def _enrich_prompt_with_cognitive_memory(self, enriched: EnrichedPrompt, prompt: str) -> EnrichedPrompt:
+        """Blend recent conversation focus with durable cognitive memories."""
+        memory = getattr(self, "cognitive_memory", None)
+        if not memory or _is_small_talk_prompt(prompt):
+            return enriched
+
+        try:
+            short_term = [
+                {"role": message.role, "content": message.content}
+                for message in self.conversation.messages[-10:]
+            ]
+            analysis = memory.analyze_memory_context(prompt, short_term_messages=short_term, top_k=5)
+            memory_context = memory.format_memory_analysis_for_prompt(analysis, char_limit=1800).strip()
+        except Exception as exc:
+            logger.warning("Cognitive memory analysis failed: %s", exc)
+            return enriched
+
+        recalled = analysis.get("relevant_memories", []) if analysis else []
+        if not memory_context or not recalled:
+            return enriched
+
+        enriched_text = (
+            "Use this short-term versus long-term memory analysis as hidden response guidance. "
+            "The latest user request always takes priority. Do not expose or quote this analysis.\n\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_BEGIN\n"
+            f"{memory_context}\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_END\n\n"
+            "Current prompt payload:\n"
+            f"{enriched.text}"
+        )
+        preview_parts = [
+            part for part in [enriched.context_preview, memory_context[:800].replace("\n", " ").strip()] if part
+        ]
+        return EnrichedPrompt(
+            text=enriched_text,
+            has_context=True,
+            context_preview=" | ".join(preview_parts)[:1800],
+        )
+
     def list_loaded_modules(self) -> Dict[str, object]:
         """Return loaded/skipped module diagnostics for UI or debugging."""
         dynamic_engines = getattr(self, "dynamic_module_engines", {}) or {}
@@ -2551,6 +2602,19 @@ class PortableLLM:
 
     def _module_db_path(self, db_name: str) -> str:
         return str(Path(__file__).resolve().parent / db_name)
+
+    def _create_cognitive_memory(self, db_path: str):
+        """Create Hades-compatible durable vector memory in the conversation database."""
+        module = self._get_loaded_module_by_filename(COGNITIVE_MEMORY_MODULE_FILE)
+        cls = getattr(module, "CognitiveLayer", None) if module else None
+        if not cls:
+            return None
+
+        try:
+            return cls(db_path=db_path)
+        except Exception as exc:
+            logger.warning("Cognitive memory module unavailable: %s", exc)
+            return None
 
     def _create_predictive_memory(self):
         """Attach the Predictive learning module when present."""
@@ -2938,6 +3002,7 @@ class PortableLLM:
 
         enriched = self._enrich_prompt_with_language_engine(prompt)
         enriched = self._enrich_prompt_with_dynamic_modules(enriched, prompt)
+        enriched = self._enrich_prompt_with_cognitive_memory(enriched, prompt)
         enriched = self._merge_enriched_prompts(enriched, self._enrich_prompt_with_knowledge(prompt))
         enriched = self._enrich_prompt_with_online_search(enriched, prompt)
         enriched = self._enrich_prompt_with_predictive_modules(enriched, prompt)
@@ -3190,6 +3255,7 @@ class PortableLLM:
             "chat_learning_enabled": self.enable_chat_learning,
             "predictive_learning_enabled": bool(self.predictive_memory),
             "echowiring_memory_enabled": bool(self.echowiring_memory),
+            "cognitive_memory_enabled": bool(getattr(self, "cognitive_memory", None)),
             "cognitive_functions_enabled": bool(self.cognitive_engine),
             "online_search_enabled": bool(self.search_augmentation),
             "english_language_module_enabled": bool(getattr(self, "english_language_engine", None)),
@@ -3279,6 +3345,9 @@ class PortableLLM:
             self.web_learner.close()
         if self.offline:
             self.offline.close()
+        close_manager = getattr(self.manager, "close", None)
+        if callable(close_manager):
+            close_manager()
 
     def export_brain_state(self) -> Dict[str, object]:
         """Return the current deterministic brain-state snapshot."""
@@ -3575,6 +3644,21 @@ class PortableLLM:
             f"memory_summary={' | '.join(memory_summary[:MAX_MEMORY_SUMMARY_BULLETS])}"
         )[:1200]
 
+        if self.cognitive_memory and memory_summary:
+            try:
+                self.cognitive_memory.remember(
+                    "\n".join(memory_summary),
+                    importance=max(0.3, min(0.9, quality.score / 100)),
+                    metadata={
+                        "type": "chat_memory_summary",
+                        "intent": profile.intent,
+                        "provider": provider,
+                        "quality_score": quality.score,
+                    },
+                )
+            except Exception as exc:
+                logger.warning("Cognitive memory write failed: %s", exc)
+
         if self.predictive_memory:
             try:
                 self.predictive_memory.add_event(
@@ -3799,6 +3883,8 @@ class PortableLLM:
     ) -> List[str]:
         """Extract compact durable memories from a chat turn without needing another model."""
         text = re.sub(r"\s+", " ", (prompt or "").strip())
+        if _looks_sensitive_memory(text):
+            return []
         lower = text.lower()
         memories: List[str] = []
 

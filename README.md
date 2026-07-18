@@ -25,6 +25,7 @@ Perseus now includes a broader set of modules under `Modules/`. These modules ar
 | `Predictive learning.py` | `PredictiveLearningMemory` | Stores events, patterns, outcomes, and lessons so future prompts can retrieve relevant predictive context. |
 | `Asyncronous Learning.py` | `EchoWiringMemory` | Predictive/asynchronous memory layer with AMM/EchoWiring fields and consent safeguards. |
 | `Cognitive Functions.py` | `GhostCoreCognitiveEngine` | Inspectable cognitive-memory layer that stores memory traces, claims, assumptions, risks, and self-model updates. |
+| `cognitive_memory.py` | `CognitiveLayer`, `MemoryAnalyzer` | Hades-compatible durable vector memory that compares recent chat focus with recalled long-term context. |
 | `Introspective Learning.py` | `IntrospectiveLearning` | Post-response critique and repair layer that catches weak answers, scaffold leakage, and internal reasoning exposure. |
 | `Autonomous Training.py` | `AutonomousTrainingMemory` | Captures high-quality interactions as candidate supervised-training examples and exports clean JSONL datasets. |
 | `Monday personality.py` | `build_monday_prompt()` | Optional Monday-style personality prompt builder. |
@@ -35,7 +36,7 @@ Perseus now includes a broader set of modules under `Modules/`. These modules ar
 
 The modules store their local state in SQLite databases beside the code by default:
 
-- `llm_portable_conversations.db` - conversations
+- `llm_portable_conversations.db` - conversations plus durable Hades-compatible cognitive memories and reflections
 - `llm_web_learning.db` - ingested web/local/chat knowledge
 - `llm_search_cache.db` - online search cache
 - `llm_self_improvement.db` - self-improvement episodes
@@ -54,6 +55,7 @@ The modules store their local state in SQLite databases beside the code by defau
 - Question decomposition that privately evaluates relevant `who`, `what`, `when`, `where`, `why`, and `how` dimensions before answering
 - Dynamic module context injection from compatible `Modules/` files
 - Predictive, asynchronous, and cognitive memory lookup before generation
+- Short-term versus long-term memory analysis that keeps the latest request authoritative while blending in relevant durable context
 - Adaptive prompt contracts that favor candid, genuine feedback with clear rationale and next steps without exposing chain-of-thought
 - Response quality scoring that penalizes short, generic, flattering, unstructured, low-rationale, or hidden-reasoning-leak answers
 - Introspective post-response repair when a draft is weak, irrelevant, or leaks internal scaffolding
