@@ -4,9 +4,10 @@ Enables embedding-based memory storage, retrieval, optimization,
 and reinforcement learning through outcome evaluation.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 import hashlib
+import queue
 import sqlite3
 import threading
 import uuid
@@ -28,6 +29,69 @@ class Memory:
     metadata: dict = field(default_factory=dict)
     access_count: int = 0  # Track how many times recalled
     reinforcement_score: float = 0.5  # Track feedback reinforcement
+    revision: int = 1
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    source_thread: str = ""
+    confidence: float = 0.5
+    parent_revision: Optional[int] = None
+    status: str = "active"
+
+    def __post_init__(self) -> None:
+        self.created_at = self.created_at or self.timestamp
+        self.updated_at = self.updated_at or self.timestamp
+
+
+@dataclass(frozen=True)
+class MemoryMutation:
+    """A Channel A/C proposal submitted to the Channel B authority."""
+    operation: str
+    memory_id: Optional[str] = None
+    expected_revision: Optional[int] = None
+    new_content: Optional[str] = None
+    changes: dict = field(default_factory=dict)
+    source: str = "conversation"
+    source_thread: str = ""
+    reason: str = ""
+    confidence: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class MemoryConflict:
+    mutation: MemoryMutation
+    current: Optional[Memory]
+    reason: str
+
+
+class MemoryCoordinator:
+    """Single synchronous queue consumer and canonical memory writer."""
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.write_queue = queue.Queue()
+        self._consumer_lock = threading.RLock()
+
+    def submit(self, mutation: MemoryMutation):
+        ticket = {"mutation": mutation, "done": threading.Event(), "result": None}
+        self.write_queue.put(ticket)
+        self._drain()
+        ticket["done"].wait()
+        return ticket["result"]
+
+    def _drain(self) -> None:
+        with self._consumer_lock:
+            while True:
+                try:
+                    ticket = self.write_queue.get_nowait()
+                except queue.Empty:
+                    return
+                try:
+                    ticket["result"] = self.owner._commit_mutation(ticket["mutation"])
+                except Exception as exc:
+                    ticket["result"] = exc
+                finally:
+                    ticket["done"].set()
+                    self.write_queue.task_done()
 
 
 @dataclass
@@ -47,10 +111,22 @@ class MemoryStore:
     
     def __init__(self):
         self.memories: List[Memory] = []
+        self._lock = threading.RLock()
 
     def add(self, memory: Memory) -> None:
         """Add a memory to the store."""
-        self.memories.append(memory)
+        with self._lock:
+            self.memories.append(memory)
+
+    def replace(self, memory: Memory) -> None:
+        """Atomically replace a canonical snapshot by ID."""
+        with self._lock:
+            self.memories = [memory if item.id == memory.id else item for item in self.memories]
+
+    def snapshot(self) -> List[Memory]:
+        """Return a stable shallow snapshot for read-only analysis."""
+        with self._lock:
+            return list(self.memories)
 
     def search(self, query_embedding: list, top_k: int = 5, use_reinforcement: bool = True) -> List[tuple]:
         """
@@ -65,7 +141,7 @@ class MemoryStore:
             return float(np.dot(a, b) / (a_norm * b_norm))
         
         scored = []
-        for m in self.memories:
+        for m in self.snapshot():
             sim = cosine_similarity(query_embedding, m.embedding)
             # Apply reinforcement bias: boost memories with higher reinforcement scores
             if use_reinforcement:
@@ -76,20 +152,23 @@ class MemoryStore:
 
     def get_memory(self, memory_id: str) -> Optional[Memory]:
         """Retrieve a specific memory by ID."""
-        for m in self.memories:
-            if m.id == memory_id:
-                return m
+        with self._lock:
+            for m in self.memories:
+                if m.id == memory_id:
+                    return m
         return None
 
     def delete(self, memory_id: str) -> bool:
         """Remove a memory from storage."""
-        initial_len = len(self.memories)
-        self.memories = [m for m in self.memories if m.id != memory_id]
-        return len(self.memories) < initial_len
+        with self._lock:
+            initial_len = len(self.memories)
+            self.memories = [m for m in self.memories if m.id != memory_id]
+            return len(self.memories) < initial_len
 
     def size(self) -> int:
         """Return total number of stored memories."""
-        return len(self.memories)
+        with self._lock:
+            return len(self.memories)
 
 
 class ReflectionEngine:
@@ -171,19 +250,16 @@ Timestamp: {datetime.utcnow()}
 
 
 class MemoryOptimizer:
-    """Handles memory pruning and compression."""
+    """Analyzes snapshots and emits proposals; it never writes canonical memory."""
     
     def prune(self, store: MemoryStore, threshold: float = 0.2) -> int:
         """
-        Remove low-importance memories below threshold.
-        Returns count of pruned memories.
+        Deprecated direct mutation API.
+
+        Channel C must submit proposals through CognitiveLayer.optimize so the
+        coordinator can enforce revisions and journal every accepted change.
         """
-        initial_count = store.size()
-        store.memories = [
-            m for m in store.memories
-            if m.importance >= threshold
-        ]
-        return initial_count - store.size()
+        raise RuntimeError("Use CognitiveLayer.optimize(); reflection cannot write canonical memory directly")
 
     def compress(self, store: MemoryStore) -> None:
         """
@@ -199,15 +275,12 @@ class MemoryOptimizer:
         Apply time-based decay to memory importance.
         Older memories gradually lose importance.
         """
-        now = datetime.utcnow()
-        for memory in store.memories:
-            age_days = (now - memory.timestamp).days
-            decay_factor = decay_rate ** (age_days / 7)  # Decay per week
-            memory.importance *= decay_factor
+        raise RuntimeError("Use CognitiveLayer.optimize(); reflection cannot write canonical memory directly")
 
     def get_statistics(self, store: MemoryStore) -> dict:
         """Get statistics about stored memories."""
-        if not store.memories:
+        memories = store.snapshot()
+        if not memories:
             return {
                 'total_memories': 0,
                 'avg_importance': 0.0,
@@ -215,8 +288,8 @@ class MemoryOptimizer:
                 'newest': None
             }
         
-        importances = [m.importance for m in store.memories]
-        timestamps = [m.timestamp for m in store.memories]
+        importances = [m.importance for m in memories]
+        timestamps = [m.timestamp for m in memories]
         
         return {
             'total_memories': store.size(),
@@ -354,8 +427,10 @@ class CognitiveLayer:
         self.embedder = embedder or self._default_embedder
         self.db_path = db_path
         self._db_lock = threading.RLock()
+        self._memory_lock = threading.RLock()
         self._memory_index = {}  # Quick lookup by content hash
         self._reinforcement_map = {}  # Map reflection IDs to memory IDs
+        self.coordinator = MemoryCoordinator(self)
         if self.db_path:
             self._init_db()
             self._load_state()
@@ -375,7 +450,14 @@ class CognitiveLayer:
                     timestamp TEXT NOT NULL,
                     metadata TEXT NOT NULL,
                     access_count INTEGER NOT NULL DEFAULT 0,
-                    reinforcement_score REAL NOT NULL DEFAULT 0.5
+                    reinforcement_score REAL NOT NULL DEFAULT 0.5,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    source_thread TEXT NOT NULL DEFAULT '',
+                    confidence REAL NOT NULL DEFAULT 0.5,
+                    parent_revision INTEGER,
+                    status TEXT NOT NULL DEFAULT 'active'
                 )
             """)
             conn.execute("""
@@ -390,14 +472,55 @@ class CognitiveLayer:
                     memory_id TEXT
                 )
             """)
+            existing_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(cognitive_memories)").fetchall()
+            }
+            migrations = {
+                "revision": "INTEGER NOT NULL DEFAULT 1",
+                "created_at": "TEXT",
+                "updated_at": "TEXT",
+                "source_thread": "TEXT NOT NULL DEFAULT ''",
+                "confidence": "REAL NOT NULL DEFAULT 0.5",
+                "parent_revision": "INTEGER",
+                "status": "TEXT NOT NULL DEFAULT 'active'",
+            }
+            for column, declaration in migrations.items():
+                if column not in existing_columns:
+                    conn.execute(f"ALTER TABLE cognitive_memories ADD COLUMN {column} {declaration}")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cognitive_memory_events (
+                    event_id TEXT PRIMARY KEY,
+                    memory_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    operation TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_thread TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    parent_revision INTEGER,
+                    snapshot TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cognitive_memory_conflicts (
+                    conflict_id TEXT PRIMARY KEY,
+                    memory_id TEXT,
+                    expected_revision INTEGER,
+                    current_revision INTEGER,
+                    proposed TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    resolved INTEGER NOT NULL DEFAULT 0
+                )
+            """)
 
     def _load_state(self) -> None:
         """Restore memories and feedback mappings from SQLite."""
         with self._db_lock, closing(self._connect()) as conn, conn:
             memory_rows = conn.execute("""
                 SELECT id, content, embedding, importance, timestamp, metadata,
-                       access_count, reinforcement_score
-                FROM cognitive_memories ORDER BY timestamp
+                       access_count, reinforcement_score, revision, created_at,
+                       updated_at, source_thread, confidence, parent_revision, status
+                FROM cognitive_memories WHERE status = 'active' ORDER BY timestamp
             """).fetchall()
             reflection_rows = conn.execute("""
                 SELECT id, user_input, ai_output, success_score, timestamp, metadata,
@@ -410,7 +533,12 @@ class CognitiveLayer:
                 id=row[0], content=row[1], embedding=json.loads(row[2]),
                 importance=float(row[3]), timestamp=datetime.fromisoformat(row[4]),
                 metadata=json.loads(row[5] or '{}'), access_count=int(row[6]),
-                reinforcement_score=float(row[7])
+                reinforcement_score=float(row[7]), revision=int(row[8] or 1),
+                created_at=datetime.fromisoformat(row[9]) if row[9] else None,
+                updated_at=datetime.fromisoformat(row[10]) if row[10] else None,
+                source_thread=row[11] or '',
+                confidence=float(row[12] if row[12] is not None else 0.5),
+                parent_revision=row[13], status=row[14] or 'active'
             )
             self.store.add(memory)
             self._memory_index[self._content_key(memory.content)] = memory.id
@@ -430,15 +558,28 @@ class CognitiveLayer:
             return
         if conn is not None:
             conn.execute("""
-                INSERT OR REPLACE INTO cognitive_memories
+                INSERT INTO cognitive_memories
                 (id, content, embedding, importance, timestamp, metadata,
-                 access_count, reinforcement_score)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 access_count, reinforcement_score, revision, created_at, updated_at,
+                 source_thread, confidence, parent_revision, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    content=excluded.content, embedding=excluded.embedding,
+                    importance=excluded.importance, timestamp=excluded.timestamp,
+                    metadata=excluded.metadata, access_count=excluded.access_count,
+                    reinforcement_score=excluded.reinforcement_score,
+                    revision=excluded.revision, created_at=excluded.created_at,
+                    updated_at=excluded.updated_at, source_thread=excluded.source_thread,
+                    confidence=excluded.confidence, parent_revision=excluded.parent_revision,
+                    status=excluded.status
             """, (
                 memory.id, memory.content, json.dumps(memory.embedding),
                 memory.importance, memory.timestamp.isoformat(),
                 json.dumps(memory.metadata), memory.access_count,
-                memory.reinforcement_score
+                memory.reinforcement_score, memory.revision,
+                memory.created_at.isoformat(), memory.updated_at.isoformat(),
+                memory.source_thread, memory.confidence, memory.parent_revision,
+                memory.status
             ))
             return
         with self._db_lock, closing(self._connect()) as connection, connection:
@@ -448,19 +589,199 @@ class CognitiveLayer:
     def _content_key(text: str) -> str:
         return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
-    def _build_memory(self, text: str, importance: float, metadata: dict = None) -> Memory:
+    def _build_memory(self, text: str, importance: float, metadata: dict = None,
+                      source_thread: str = "", confidence: float = 0.5) -> Memory:
+        now = datetime.utcnow()
         return Memory(
             id=str(uuid.uuid4()),
             content=text,
             embedding=self.embedder(text),
             importance=importance,
-            timestamp=datetime.utcnow(),
-            metadata=metadata or {}
+            timestamp=now,
+            metadata=metadata or {},
+            created_at=now,
+            updated_at=now,
+            source_thread=source_thread,
+            confidence=confidence,
         )
 
     def _publish_memory(self, memory: Memory) -> None:
         self.store.add(memory)
         self._memory_index[self._content_key(memory.content)] = memory.id
+
+    @staticmethod
+    def _memory_snapshot(memory: Memory) -> dict:
+        return {
+            "id": memory.id,
+            "content": memory.content,
+            "importance": memory.importance,
+            "metadata": memory.metadata,
+            "access_count": memory.access_count,
+            "reinforcement_score": memory.reinforcement_score,
+            "revision": memory.revision,
+            "created_at": memory.created_at.isoformat(),
+            "updated_at": memory.updated_at.isoformat(),
+            "source_thread": memory.source_thread,
+            "confidence": memory.confidence,
+            "parent_revision": memory.parent_revision,
+            "status": memory.status,
+        }
+
+    def _record_event(self, conn, mutation: MemoryMutation, memory: Memory) -> None:
+        if not self.db_path:
+            return
+        conn.execute("""
+            INSERT INTO cognitive_memory_events
+            (event_id, memory_id, revision, operation, occurred_at, source,
+             source_thread, reason, parent_revision, snapshot)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(uuid.uuid4()), memory.id, memory.revision, mutation.operation.upper(),
+            memory.updated_at.isoformat(), mutation.source,
+            mutation.source_thread or memory.source_thread,
+            mutation.reason, memory.parent_revision,
+            json.dumps(self._memory_snapshot(memory), sort_keys=True),
+        ))
+
+    def _record_conflict(self, mutation: MemoryMutation, current: Optional[Memory], reason: str) -> None:
+        if not self.db_path:
+            return
+        with self._db_lock, closing(self._connect()) as conn, conn:
+            conn.execute("""
+                INSERT INTO cognitive_memory_conflicts
+                (conflict_id, memory_id, expected_revision, current_revision,
+                 proposed, created_at, resolved)
+                VALUES (?, ?, ?, ?, ?, ?, 0)
+            """, (
+                str(uuid.uuid4()), mutation.memory_id, mutation.expected_revision,
+                current.revision if current else None,
+                json.dumps({
+                    "operation": mutation.operation,
+                    "new_content": mutation.new_content,
+                    "changes": mutation.changes,
+                    "source": mutation.source,
+                    "reason": mutation.reason,
+                }, sort_keys=True),
+                datetime.utcnow().isoformat(),
+            ))
+
+    def _commit_mutation(self, mutation: MemoryMutation):
+        """Channel B commit boundary. No other method changes canonical memory."""
+        operation = mutation.operation.upper()
+        with self._memory_lock:
+            current = self.store.get_memory(mutation.memory_id) if mutation.memory_id else None
+            if operation != "ADD" and current is None:
+                conflict = MemoryConflict(mutation, None, "memory does not exist or is not active")
+                self._record_conflict(mutation, None, conflict.reason)
+                return conflict
+            if (
+                current is not None
+                and mutation.expected_revision is not None
+                and current.revision != mutation.expected_revision
+            ):
+                conflict = MemoryConflict(
+                    mutation, replace(current),
+                    f"expected revision {mutation.expected_revision}, found {current.revision}",
+                )
+                self._record_conflict(mutation, current, conflict.reason)
+                return conflict
+
+            now = datetime.utcnow()
+            if operation == "ADD":
+                if current is not None:
+                    conflict = MemoryConflict(mutation, replace(current), "memory ID already exists")
+                    self._record_conflict(mutation, current, conflict.reason)
+                    return conflict
+                content = (mutation.new_content or "").strip()
+                if not content:
+                    raise ValueError("ADD requires non-empty content")
+                changes = mutation.changes
+                updated = self._build_memory(
+                    content,
+                    float(changes.get("importance", 0.5)),
+                    dict(changes.get("metadata") or {}),
+                    source_thread=mutation.source_thread,
+                    confidence=float(mutation.confidence if mutation.confidence is not None else 0.5),
+                )
+                if mutation.memory_id:
+                    updated.id = mutation.memory_id
+            elif operation in {"UPDATE", "REINFORCE", "ACCESS", "FORGET"}:
+                changes = dict(mutation.changes)
+                content = mutation.new_content if mutation.new_content is not None else current.content
+                allowed = {
+                    "importance", "metadata", "access_count", "reinforcement_score",
+                    "confidence", "status",
+                }
+                unknown = set(changes) - allowed
+                if unknown:
+                    raise ValueError(f"Unsupported memory fields: {sorted(unknown)}")
+                proposed_confidence = changes.pop("confidence", current.confidence)
+                updated = replace(
+                    current,
+                    content=content,
+                    embedding=self.embedder(content) if content != current.content else list(current.embedding),
+                    revision=current.revision + 1,
+                    parent_revision=current.revision,
+                    updated_at=now,
+                    source_thread=mutation.source_thread or current.source_thread,
+                    confidence=float(
+                        mutation.confidence if mutation.confidence is not None
+                        else proposed_confidence
+                    ),
+                    **changes,
+                )
+                if operation == "FORGET":
+                    updated.status = "forgotten"
+            else:
+                raise ValueError(f"Unsupported memory operation: {operation}")
+
+            if self.db_path:
+                with self._db_lock, closing(self._connect()) as conn, conn:
+                    self._save_memory(updated, conn=conn)
+                    self._record_event(conn, mutation, updated)
+
+            if current is None:
+                self._publish_memory(updated)
+            elif updated.status != "active":
+                self.store.delete(updated.id)
+                self._memory_index = {
+                    key: value for key, value in self._memory_index.items() if value != updated.id
+                }
+            else:
+                old_key = self._content_key(current.content)
+                self.store.replace(updated)
+                self._memory_index.pop(old_key, None)
+                self._memory_index[self._content_key(updated.content)] = updated.id
+            return replace(updated)
+
+    def submit_memory_mutation(self, mutation: MemoryMutation):
+        """Submit a proposal and return a committed snapshot or MemoryConflict."""
+        result = self.coordinator.submit(mutation)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def get_memory_history(self, memory_id: str) -> List[dict]:
+        """Return the append-only revision chain for audit and reconciliation."""
+        if not self.db_path:
+            memory = self.store.get_memory(memory_id)
+            return [self._memory_snapshot(memory)] if memory else []
+        with self._db_lock, closing(self._connect()) as conn:
+            rows = conn.execute("""
+                SELECT event_id, revision, operation, occurred_at, source,
+                       source_thread, reason, parent_revision, snapshot
+                FROM cognitive_memory_events
+                WHERE memory_id = ? ORDER BY revision, occurred_at
+            """, (memory_id,)).fetchall()
+        return [
+            {
+                "event_id": row[0], "revision": row[1], "operation": row[2],
+                "occurred_at": row[3], "source": row[4], "source_thread": row[5],
+                "reason": row[6], "parent_revision": row[7],
+                "snapshot": json.loads(row[8]),
+            }
+            for row in rows
+        ]
 
     def _default_embedder(self, text: str) -> list:
         """
@@ -482,7 +803,8 @@ class CognitiveLayer:
             embedding = [x / norm for x in embedding]
         return embedding
 
-    def remember(self, text: str, importance: float = 0.5, metadata: dict = None) -> str:
+    def remember(self, text: str, importance: float = 0.5, metadata: dict = None,
+                 source_thread: str = "", confidence: float = 0.5) -> str:
         """
         Store a new memory.
         
@@ -494,10 +816,30 @@ class CognitiveLayer:
         Returns:
             Memory ID
         """
-        mem = self._build_memory(text, importance, metadata)
-        self._save_memory(mem)
-        self._publish_memory(mem)
-        return mem.id
+        result = self.submit_memory_mutation(MemoryMutation(
+            operation="ADD",
+            new_content=text,
+            changes={"importance": importance, "metadata": metadata or {}},
+            source="conversation",
+            source_thread=source_thread,
+            reason="active cognition proposed a durable memory",
+            confidence=confidence,
+        ))
+        return result.id
+
+    def update_memory(self, memory_id: str, expected_revision: int, new_content: str,
+                      metadata: dict = None, source: str = "conversation",
+                      source_thread: str = "", reason: str = ""):
+        """Optimistically update a memory without silently overwriting a newer revision."""
+        changes = {}
+        if metadata is not None:
+            changes["metadata"] = metadata
+        return self.submit_memory_mutation(MemoryMutation(
+            operation="UPDATE", memory_id=memory_id,
+            expected_revision=expected_revision, new_content=new_content,
+            changes=changes, source=source, source_thread=source_thread,
+            reason=reason,
+        ))
 
     def recall(self, query: str, top_k: int = 5, use_reinforcement: bool = True) -> List[tuple]:
         """
@@ -515,15 +857,17 @@ class CognitiveLayer:
         results = self.store.search(query_embedding, top_k, use_reinforcement)
         
         # Track access for memory usage patterns
-        for _, memory in results:
-            memory.access_count += 1
-            try:
-                self._save_memory(memory)
-            except Exception:
-                memory.access_count -= 1
-                raise
-        
-        return results
+        committed_results = []
+        for score, memory in results:
+            committed = self.submit_memory_mutation(MemoryMutation(
+                operation="ACCESS", memory_id=memory.id,
+                expected_revision=memory.revision,
+                changes={"access_count": memory.access_count + 1},
+                source="active_recall", reason="memory recalled for active cognition",
+            ))
+            committed_results.append((score, committed if isinstance(committed, Memory) else memory))
+
+        return committed_results
 
     def optimize(self, prune_threshold: float = 0.2, apply_decay: bool = True) -> dict:
         """
@@ -537,42 +881,37 @@ class CognitiveLayer:
             Optimization statistics
         """
         stats_before = self.optimizer.get_statistics(self.store)
-        original_memories = list(self.store.memories)
-        original_importance = {memory.id: memory.importance for memory in original_memories}
-        try:
+        snapshot = self.store.snapshot()
+        now = datetime.utcnow()
+        pruned = 0
+        conflicts = 0
+        for memory in snapshot:
+            importance = memory.importance
             if apply_decay:
-                self.optimizer.decay(self.store)
+                age_days = (now - memory.timestamp).days
+                importance *= 0.95 ** (age_days / 7)
+            operation = "FORGET" if importance < prune_threshold else "UPDATE"
+            changes = {} if operation == "FORGET" else {"importance": importance}
+            result = self.submit_memory_mutation(MemoryMutation(
+                operation=operation,
+                memory_id=memory.id,
+                expected_revision=memory.revision,
+                changes=changes,
+                source="reflection",
+                reason=(
+                    "reflection proposed pruning below importance threshold"
+                    if operation == "FORGET" else "reflection proposed time-based decay"
+                ),
+            ))
+            if isinstance(result, MemoryConflict):
+                conflicts += 1
+            elif operation == "FORGET":
+                pruned += 1
 
-            pruned = self.optimizer.prune(self.store, prune_threshold)
-            self.optimizer.compress(self.store)
-
-            stats_after = self.optimizer.get_statistics(self.store)
-            if self.db_path:
-                with self._db_lock, closing(self._connect()) as conn, conn:
-                    conn.execute("DELETE FROM cognitive_memories")
-                    conn.executemany(
-                    """INSERT INTO cognitive_memories
-                    (id, content, embedding, importance, timestamp, metadata,
-                     access_count, reinforcement_score)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    [
-                        (
-                            memory.id, memory.content, json.dumps(memory.embedding),
-                            memory.importance, memory.timestamp.isoformat(),
-                            json.dumps(memory.metadata), memory.access_count,
-                            memory.reinforcement_score
-                        )
-                        for memory in self.store.memories
-                    ]
-                )
-        except Exception:
-            self.store.memories = original_memories
-            for memory in original_memories:
-                memory.importance = original_importance[memory.id]
-            raise
-        
+        stats_after = self.optimizer.get_statistics(self.store)
         return {
             'pruned_count': pruned,
+            'conflict_count': conflicts,
             'stats_before': stats_before,
             'stats_after': stats_after
         }
@@ -582,15 +921,12 @@ class CognitiveLayer:
         memory = self.store.get_memory(memory_id)
         if not memory:
             return False
-        if self.db_path:
-            with self._db_lock, closing(self._connect()) as conn, conn:
-                conn.execute("DELETE FROM cognitive_memories WHERE id = ?", (memory_id,))
-        deleted = self.store.delete(memory_id)
-        if deleted:
-            self._memory_index = {
-                key: value for key, value in self._memory_index.items() if value != memory_id
-            }
-        return deleted
+        result = self.submit_memory_mutation(MemoryMutation(
+            operation="FORGET", memory_id=memory_id,
+            expected_revision=memory.revision, source="conversation",
+            reason="explicit forget request",
+        ))
+        return isinstance(result, Memory)
 
     def get_memory_stats(self) -> dict:
         """Get current memory statistics."""
@@ -602,11 +938,12 @@ class CognitiveLayer:
 
     def clear(self) -> None:
         """Clear all memories."""
-        if self.db_path:
-            with self._db_lock, closing(self._connect()) as conn, conn:
-                conn.execute("DELETE FROM cognitive_memories")
-        self.store.memories.clear()
-        self._memory_index.clear()
+        for memory in self.store.snapshot():
+            self.submit_memory_mutation(MemoryMutation(
+                operation="FORGET", memory_id=memory.id,
+                expected_revision=memory.revision, source="system",
+                reason="clear requested",
+            ))
     
     # ========== Feedback Loop Methods ==========
     
@@ -631,19 +968,25 @@ class CognitiveLayer:
         
         # Optionally store the reflection itself as a memory
         importance = self.reflection.calculate_reinforcement(success_score)
-        memory = self._build_memory(
-            reflection.reflected_content,
-            importance,
-            {
-                'type': 'reflection',
-                'reinforcement': True,
-                'success_score': success_score
+        memory = self.submit_memory_mutation(MemoryMutation(
+            operation="ADD",
+            new_content=reflection.reflected_content,
+            changes={
+                "importance": importance,
+                "metadata": {
+                    'type': 'reflection',
+                    'reinforcement': True,
+                    'success_score': success_score
+                },
             },
-        )
+            source="reflection",
+            source_thread=str((metadata or {}).get("source_thread", "")),
+            reason="outcome reflection proposed a durable lesson",
+            confidence=success_score,
+        ))
         try:
             if self.db_path:
                 with self._db_lock, closing(self._connect()) as conn, conn:
-                    self._save_memory(memory, conn=conn)
                     conn.execute("""
                         INSERT OR REPLACE INTO cognitive_reflections
                         (id, user_input, ai_output, success_score, timestamp, metadata,
@@ -655,7 +998,6 @@ class CognitiveLayer:
                         json.dumps(reflection.metadata), reflection.reflected_content,
                         memory.id
                     ))
-            self._publish_memory(memory)
             self._reinforcement_map[reflection.id] = memory.id
         except Exception:
             self.reflection.reflections = [
@@ -681,29 +1023,28 @@ class CognitiveLayer:
         if not memory:
             return False
 
-        old_reinforcement = memory.reinforcement_score
-        old_importance = memory.importance
-        
         # Update reinforcement score with exponential moving average
         alpha = 0.3  # Learning rate
-        memory.reinforcement_score = (
+        reinforcement_score = (
             alpha * success_score + (1 - alpha) * memory.reinforcement_score
         )
         
         # Adjust importance based on reinforcement
         new_importance = self.reflection.calculate_reinforcement(
-            memory.reinforcement_score,
+            reinforcement_score,
             base_importance=0.3
         )
-        memory.importance = max(memory.importance, new_importance)
-        try:
-            self._save_memory(memory)
-        except Exception:
-            memory.reinforcement_score = old_reinforcement
-            memory.importance = old_importance
-            raise
-        
-        return True
+        result = self.submit_memory_mutation(MemoryMutation(
+            operation="REINFORCE", memory_id=memory_id,
+            expected_revision=memory.revision,
+            changes={
+                "reinforcement_score": reinforcement_score,
+                "importance": max(memory.importance, new_importance),
+            },
+            source="reflection", reason="outcome feedback reinforced this memory",
+            confidence=success_score,
+        ))
+        return isinstance(result, Memory)
     
     def generate_with_memory(self, query: str, context_provider: Callable) -> Tuple[str, List[tuple]]:
         """
@@ -752,9 +1093,10 @@ class CognitiveLayer:
         reflection_stats = self.get_reflection_stats()
         
         # Calculate memory quality metrics
-        if self.store.memories:
-            access_counts = [m.access_count for m in self.store.memories]
-            reinforcement_scores = [m.reinforcement_score for m in self.store.memories]
+        memories = self.store.snapshot()
+        if memories:
+            access_counts = [m.access_count for m in memories]
+            reinforcement_scores = [m.reinforcement_score for m in memories]
             
             memory_stats['avg_access_count'] = float(np.mean(access_counts))
             memory_stats['avg_reinforcement'] = float(np.mean(reinforcement_scores))
@@ -765,12 +1107,13 @@ class CognitiveLayer:
             'reflections': reflection_stats,
             'integration_quality': {
                 'reinforced_memories': sum(
-                    1 for m in self.store.memories 
+                    1 for m in memories
                     if m.reinforcement_score > 0.5
                 ),
                 'frequently_accessed': sum(
-                    1 for m in self.store.memories 
+                    1 for m in memories
                     if m.access_count > 2
-                )
+                ),
+                'single_writer_queue_depth': self.coordinator.write_queue.qsize(),
             }
         }

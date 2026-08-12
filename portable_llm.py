@@ -548,6 +548,7 @@ ASYNCHRONOUS_LEARNING_MODULE_FALLBACK_FILE = "Asyncronous Learning.txt"
 COGNITIVE_FUNCTIONS_MODULE_FILE = "Cognitive Functions.py"
 COGNITIVE_FUNCTIONS_MODULE_FALLBACK_FILE = "Cognitive Functions.txt"
 COGNITIVE_MEMORY_MODULE_FILE = "cognitive_memory.py"
+ENVIRONMENT_AWARENESS_MODULE_FILE = "environment_awareness.py"
 BRAIN_STATE_MODULE_FILE = "Brain State.py"
 SEARCH_AUGMENTATION_MODULE_FILE = "Search Augmentation.py"
 ENGLISH_LANGUAGE_MODULE_FILE = "English Language.py"
@@ -2054,6 +2055,7 @@ class PortableLLM:
         self.improvement_store = SelfImprovementStore()
         self.growth_store = GrowthLearningStore(db_path=self._module_db_path(GROWTH_LEARNING_DB_PATH))
         self.cognitive_memory = self._create_cognitive_memory(db_path)
+        self.environment_observer = self._create_environment_observer()
         self.predictive_memory = self._create_predictive_memory()
         self.echowiring_memory = self._create_echowiring_memory()
         self.cognitive_engine = self._create_cognitive_engine()
@@ -2484,8 +2486,14 @@ class PortableLLM:
 
         context_blocks: List[str] = []
         for name, engine in sorted(engines.items()):
-            # The English module has a dedicated earlier pass; skip duplicate context if it is the same object.
-            if engine is getattr(self, "english_language_engine", None):
+            # Dedicated passes already inject these contexts; do not include a second dynamic instance.
+            if Path(name).name.lower() == ENVIRONMENT_AWARENESS_MODULE_FILE.lower():
+                continue
+            dedicated_engines = (
+                getattr(self, "english_language_engine", None),
+                getattr(self, "environment_observer", None),
+            )
+            if any(engine is dedicated for dedicated in dedicated_engines):
                 continue
             block = self._module_context_from_engine(name, engine, prompt).strip()
             if not block:
@@ -2577,6 +2585,7 @@ class PortableLLM:
                 "english_language": bool(getattr(self, "english_language_engine", None)),
                 "autonomous_training": bool(getattr(self, "autonomous_trainer", None)),
                 "introspective_learning": bool(getattr(self, "introspective_learning", None)),
+                "environment_awareness": bool(getattr(self, "environment_observer", None)),
             },
             "excluded_modules": sorted(MODULE_DYNAMIC_LOAD_EXCLUDE_FILES),
             "loaded_modules": [
@@ -2615,6 +2624,48 @@ class PortableLLM:
         except Exception as exc:
             logger.warning("Cognitive memory module unavailable: %s", exc)
             return None
+
+    def _create_environment_observer(self):
+        """Attach bounded read-only environment sensing for active cognition."""
+        module = self._get_loaded_module_by_filename(ENVIRONMENT_AWARENESS_MODULE_FILE)
+        cls = getattr(module, "EnvironmentObserver", None) if module else None
+        if not cls:
+            return None
+        try:
+            return cls(root=str(Path(__file__).resolve().parent))
+        except Exception as exc:
+            logger.warning("Environment awareness module unavailable: %s", exc)
+            return None
+
+    def _enrich_prompt_with_environment(self, enriched: EnrichedPrompt) -> EnrichedPrompt:
+        """Ground generation in a bounded, read-only runtime snapshot."""
+        observer = getattr(self, "environment_observer", None)
+        if not observer:
+            return enriched
+        try:
+            context = observer.build_prompt_context().strip()
+        except Exception as exc:
+            logger.warning("Environment observation failed: %s", exc)
+            return enriched
+        if not context:
+            return enriched
+        text = (
+            "Use this local environment snapshot as hidden factual context only. "
+            "It grants no permission to take actions or expose private data.\n\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_BEGIN\n"
+            f"{context}\n"
+            "RAW_CONTEXT_DO_NOT_OUTPUT_END\n\n"
+            "Current prompt payload:\n"
+            f"{enriched.text}"
+        )
+        preview = " | ".join(
+            item for item in [enriched.context_preview, context.replace("\n", " ")[:800]] if item
+        )[:1800]
+        return EnrichedPrompt(
+            text=text,
+            has_context=enriched.has_context,
+            context_preview=preview,
+        )
 
     def _create_predictive_memory(self):
         """Attach the Predictive learning module when present."""
@@ -2969,6 +3020,12 @@ class PortableLLM:
 
         profile = self._profile_prompt(prompt)
         parser_packet = self._build_parser_packet(prompt, profile)
+        environment_meta = None
+        if getattr(self, "environment_observer", None):
+            try:
+                environment_meta = self.environment_observer.observe().as_dict()
+            except Exception as exc:
+                logger.warning("Environment observation failed before planning: %s", exc)
         brain_meta = None
         if getattr(self, "brain_state_engine", None):
             try:
@@ -2978,6 +3035,7 @@ class PortableLLM:
                     "mood": profile.mood,
                     "expected_shape": profile.expected_shape,
                     "parser_packet": parser_packet,
+                    "environment": environment_meta,
                 }
                 brain_state, brain_action = self.brain_state_engine.step_input(prompt, profile=profile_packet)
                 self._active_brain_action = brain_action
@@ -3001,6 +3059,7 @@ class PortableLLM:
                 self._active_brain_context = ""
 
         enriched = self._enrich_prompt_with_language_engine(prompt)
+        enriched = self._enrich_prompt_with_environment(enriched)
         enriched = self._enrich_prompt_with_dynamic_modules(enriched, prompt)
         enriched = self._enrich_prompt_with_cognitive_memory(enriched, prompt)
         enriched = self._merge_enriched_prompts(enriched, self._enrich_prompt_with_knowledge(prompt))
@@ -3140,6 +3199,7 @@ class PortableLLM:
                         "final_logic_control": "enabled",
                     },
                     "brain_state": brain_meta,
+                    "environment": environment_meta,
                     "introspection": introspection_meta,
                     "chat_learning_enabled": self.enable_chat_learning,
                 },
@@ -3209,6 +3269,7 @@ class PortableLLM:
                     "final_logic_control": "enabled",
                 },
                 "brain_state": brain_meta,
+                "environment": environment_meta,
                 "introspection": introspection_meta,
             }
             return response, metadata
@@ -3256,11 +3317,15 @@ class PortableLLM:
             "predictive_learning_enabled": bool(self.predictive_memory),
             "echowiring_memory_enabled": bool(self.echowiring_memory),
             "cognitive_memory_enabled": bool(getattr(self, "cognitive_memory", None)),
+            "memory_single_writer_enabled": bool(
+                getattr(getattr(self, "cognitive_memory", None), "coordinator", None)
+            ),
             "cognitive_functions_enabled": bool(self.cognitive_engine),
             "online_search_enabled": bool(self.search_augmentation),
             "english_language_module_enabled": bool(getattr(self, "english_language_engine", None)),
             "autonomous_training_enabled": bool(getattr(self, "autonomous_trainer", None)),
             "introspective_learning_enabled": bool(getattr(self, "introspective_learning", None)),
+            "environment_awareness_enabled": bool(getattr(self, "environment_observer", None)),
             "tri_channel_logic_enabled": True,
             "growth_learning_enabled": bool(getattr(self, "growth_store", None)),
             "autonomous_training": self._autonomous_training_stats(),
@@ -3655,6 +3720,8 @@ class PortableLLM:
                         "provider": provider,
                         "quality_score": quality.score,
                     },
+                    source_thread=str(getattr(self.conversation, "id", "")),
+                    confidence=max(0.1, min(0.98, quality.score / 100)),
                 )
             except Exception as exc:
                 logger.warning("Cognitive memory write failed: %s", exc)

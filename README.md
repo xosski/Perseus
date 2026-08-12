@@ -26,6 +26,7 @@ Perseus now includes a broader set of modules under `Modules/`. These modules ar
 | `Asyncronous Learning.py` | `EchoWiringMemory` | Predictive/asynchronous memory layer with AMM/EchoWiring fields and consent safeguards. |
 | `Cognitive Functions.py` | `GhostCoreCognitiveEngine` | Inspectable cognitive-memory layer that stores memory traces, claims, assumptions, risks, and self-model updates. |
 | `cognitive_memory.py` | `CognitiveLayer`, `MemoryAnalyzer` | Hades-compatible durable vector memory that compares recent chat focus with recalled long-term context. |
+| `environment_awareness.py` | `EnvironmentObserver` | Bounded, read-only project/runtime snapshots used by active cognition before planning. |
 | `Introspective Learning.py` | `IntrospectiveLearning` | Post-response critique and repair layer that catches weak answers, scaffold leakage, and internal reasoning exposure. |
 | `Autonomous Training.py` | `AutonomousTrainingMemory` | Captures high-quality interactions as candidate supervised-training examples and exports clean JSONL datasets. |
 | `Monday personality.py` | `build_monday_prompt()` | Optional Monday-style personality prompt builder. |
@@ -47,11 +48,30 @@ The modules store their local state in SQLite databases beside the code by defau
 - `introspective_learning.db` - critique/repair traces
 - `perseus_autonomous_training.db` - accepted/rejected training examples and model-candidate metadata
 
+### Three Memory Channels
+
+Perseus cognitive memory now uses logical channels with one canonical writer:
+
+```text
+ACTIVE cognition ── proposals ──► MEMORY coordinator ◄── proposals ── REFLECTION
+       │                              │
+       └──────── reads ◄──────────────┤
+                                      ▼
+                            append-only event journal
+```
+
+- **Active cognition** recalls canonical snapshots and proposes `ADD`, `UPDATE`, `ACCESS`, `REINFORCE`, or `FORGET` mutations.
+- **Memory authority** serializes proposals through one queue, checks `expected_revision`, updates the current snapshot, and appends an audit event. Stale writes become reconciliation conflicts instead of overwrites.
+- **Reflection** analyzes stable snapshots and submits decay/prune proposals to the same authority; it cannot directly change the store.
+
+Each canonical memory includes `revision`, `created_at`, `updated_at`, `source_thread`, `confidence`, `parent_revision`, and status. Forgotten memories remain in the revision/event history instead of being physically erased.
+
 ## Response Sophistication
 
 - Intent profiling for each prompt (`technical`, `educational`, `strategic`, `analytical`, `feedback`)
 - English-language pre-analysis before retrieval and generation
 - Deterministic brain-state planning that tracks active goal, focus terms, uncertainty policy, and response strategy
+- Read-only awareness of the local project root, runtime, Git branch/status, and top-level structure before brain-state planning
 - Question decomposition that privately evaluates relevant `who`, `what`, `when`, `where`, `why`, and `how` dimensions before answering
 - Dynamic module context injection from compatible `Modules/` files
 - Predictive, asynchronous, and cognitive memory lookup before generation
