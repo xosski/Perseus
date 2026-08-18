@@ -182,7 +182,11 @@ class OpenAIProvider(LLMProviderBase):
         if self.api_key:
             try:
                 from openai import OpenAI
-                self.client = OpenAI(api_key=self.api_key)
+                base_url = os.getenv("OPENAI_BASE_URL", "").strip()
+                client_options = {"api_key": self.api_key}
+                if base_url:
+                    client_options["base_url"] = base_url
+                self.client = OpenAI(**client_options)
                 self.available = True
                 logger.info("OpenAI provider initialized")
             except ImportError:
@@ -452,7 +456,7 @@ class AzureOpenAIProvider(LLMProviderBase):
             options = _safe_generation_options(kwargs)
             messages = _safe_messages(kwargs.get("messages"), prompt)
             response = self.client.chat.completions.create(
-                deployment_name=kwargs.get("deployment", DEFAULT_AZURE_DEPLOYMENT),
+                model=kwargs.get("model") or kwargs.get("deployment", DEFAULT_AZURE_DEPLOYMENT),
                 messages=messages,
                 max_tokens=options["max_tokens"],
                 temperature=options["temperature"]
@@ -661,6 +665,12 @@ class ConversationManager:
         
         available = [name for name, prov in self.providers.items() if prov.available]
         logger.info(f"Available LLM providers: {available}")
+
+    def reload_providers(self) -> List[str]:
+        """Re-read process configuration and rebuild provider clients."""
+        with self.lock:
+            self._init_providers()
+        return self.get_available_providers()
 
     def _default_model_for(self, provider: str) -> str:
         model_map = {

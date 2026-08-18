@@ -124,6 +124,9 @@ class EnvironmentObserverTests(unittest.TestCase):
         self.assertLessEqual(len(snapshot.top_level_entries), 40)
         context = observer.build_prompt_context()
         self.assertIn("Read-only local environment snapshot", context)
+        self.assertIn("Local date and time:", context)
+        self.assertTrue(snapshot.local_datetime)
+        self.assertTrue(snapshot.timezone_name)
         self.assertIn("Do not infer permission", context)
 
 

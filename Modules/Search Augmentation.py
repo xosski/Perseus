@@ -133,6 +133,14 @@ class SearchAugmentation:
         prompt_clean = (prompt or "").strip()
         prompt_lower = prompt_clean.lower()
         draft_lower = (draft_response or "").lower()
+        lookup_lower = re.sub(
+            r"^(?:hey|hello|hi)\b[\s,]*(?:perseus\b[\s,]*)?", "", prompt_lower
+        )
+        lookup_lower = re.sub(
+            r"^(?:(?:can|could|would) you (?:please )?tell me|tell me|please tell me|explain)\s+",
+            "",
+            lookup_lower,
+        )
 
         no_search_patterns = [
             r"^hi\b",
@@ -143,7 +151,9 @@ class SearchAugmentation:
             r"translate this",
             r"summarize this text",
         ]
-        if any(re.search(pattern, prompt_lower) for pattern in no_search_patterns):
+        if len(prompt_lower.split()) <= 4 and any(
+            re.search(pattern, prompt_lower) for pattern in no_search_patterns
+        ):
             return SearchDecision(False, "Prompt does not require online lookup.", 0.9)
 
         explicit_terms = [
@@ -179,6 +189,13 @@ class SearchAugmentation:
         ]
         if any(term in prompt_lower for term in explicit_terms):
             return SearchDecision(True, "User explicitly requested current or online information.", 0.95)
+
+        if re.search(
+            r"\b(?:more|additional|further) (?:information|details?)\b|"
+            r"\b(?:elaborate|expand on|go deeper|continue explaining|in more detail)\b",
+            prompt_lower,
+        ):
+            return SearchDecision(True, "The user requested a deeper explanation.", 0.84)
 
         current_sensitive_terms = [
             "ceo",
@@ -218,8 +235,8 @@ class SearchAugmentation:
         if re.search(r"\b20(?:2[4-9]|3\d)\b", prompt_lower):
             return SearchDecision(True, "Question includes a recent or future year.", 0.78)
 
-        factual_lookup_pattern = r"^(?:tell me about|what is|what are|who is|who are|where is|where are|when is|when did|how is|how are|how does|how do)\b"
-        if not (local_context or "").strip() and re.search(factual_lookup_pattern, prompt_lower):
+        factual_lookup_pattern = r"^(?:about|what is|what are|who is|who are|where is|where are|when is|when did|how is|how are|how does|how do|how to)\b"
+        if not (local_context or "").strip() and re.search(factual_lookup_pattern, lookup_lower):
             return SearchDecision(True, "No local context was found for a factual lookup-style question.", 0.72)
 
         if quality_score is not None and quality_score < 60:
@@ -250,7 +267,7 @@ class SearchAugmentation:
 
         is_weather_query = self._is_weather_query(query)
         cached = None if force_refresh or is_weather_query else self._get_cached(query)
-        if cached is not None:
+        if cached is not None and (not self.allow_network or not self._cached_results_need_refresh(cached)):
             return cached[: self.max_results]
 
         if not self.allow_network:
@@ -287,7 +304,8 @@ class SearchAugmentation:
                 continue
             page_text = self._fetch_page_excerpt(result.url)
             if page_text and page_text.lower() not in (result.snippet or "").lower():
-                snippet = f"{result.snippet} Page excerpt: {page_text}".strip()
+                lead = (result.snippet or "").strip().rstrip(" .")
+                snippet = f"{lead}. {page_text}".strip(" .")
                 enriched.append(SearchResult(
                     title=result.title,
                     url=result.url,
@@ -306,11 +324,41 @@ class SearchAugmentation:
         html = self._request_text(url)
         if not html:
             return ""
+
+        # Paragraphs carry article content far more reliably than the beginning of
+        # the flattened page, which is commonly menus, account links, and tables of contents.
+        paragraphs: List[str] = []
+        for raw_paragraph in re.findall(r"(?is)<p(?:\s[^>]*)?>(.*?)</p>", html):
+            paragraph = self._strip_html(raw_paragraph)
+            if len(paragraph) < 80 or self._looks_like_page_chrome(paragraph):
+                continue
+            paragraphs.append(paragraph)
+            if sum(len(item) for item in paragraphs) >= 1000:
+                break
+        if paragraphs:
+            return " ".join(paragraphs)[:1000].rsplit(" ", 1)[0].strip()
+
         text = re.sub(r"(?is)<(script|style|noscript|svg).*?>.*?</\1>", " ", html)
         text = self._strip_html(text)
-        # Prefer the beginning of the readable page body; search result pages often
-        # include navigation, but even that is better bounded than raw HTML.
         return text[:1000].rsplit(" ", 1)[0].strip()
+
+    @classmethod
+    def _cached_results_need_refresh(cls, results: List[SearchResult]) -> bool:
+        """Refresh cached excerpts produced from page navigation instead of article text."""
+        return any(
+            "page excerpt:" in (result.snippet or "").lower()
+            and cls._looks_like_page_chrome(result.snippet)
+            for result in results[:2]
+        )
+
+    @staticmethod
+    def _looks_like_page_chrome(text: str) -> bool:
+        lower = (text or "").lower()
+        markers = [
+            "jump to content", "main menu", "move to sidebar", "create account",
+            "log in", "skip to main content", "site search", "privacy policy",
+        ]
+        return sum(marker in lower for marker in markers) >= 2
 
     def _request_json(
         self,

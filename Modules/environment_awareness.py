@@ -15,6 +15,9 @@ from typing import List, Optional
 @dataclass(frozen=True)
 class EnvironmentSnapshot:
     observed_at: str
+    local_datetime: str
+    timezone_name: str
+    utc_offset: str
     working_directory: str
     project_name: str
     operating_system: str
@@ -26,6 +29,9 @@ class EnvironmentSnapshot:
     def as_dict(self) -> dict:
         return {
             "observed_at": self.observed_at,
+            "local_datetime": self.local_datetime,
+            "timezone_name": self.timezone_name,
+            "utc_offset": self.utc_offset,
             "working_directory": self.working_directory,
             "project_name": self.project_name,
             "operating_system": self.operating_system,
@@ -73,8 +79,15 @@ class EnvironmentObserver:
                 entries = []
 
             status_lines = self._git("status", "--short").splitlines()[:25]
+            observed_utc = datetime.now(timezone.utc)
+            observed_local = observed_utc.astimezone()
+            offset = observed_local.strftime("%z")
+            offset_label = f"UTC{offset[:3]}:{offset[3:]}" if len(offset) == 5 else "unknown"
             self._cached = EnvironmentSnapshot(
-                observed_at=datetime.now(timezone.utc).isoformat(),
+                observed_at=observed_utc.isoformat(),
+                local_datetime=observed_local.strftime("%A, %B %d, %Y at %I:%M:%S %p").replace(" 0", " "),
+                timezone_name=observed_local.tzname() or "local time",
+                utc_offset=offset_label,
                 working_directory=str(self.root),
                 project_name=self.root.name,
                 operating_system=f"{platform.system()} {platform.release()} ({platform.machine()})",
@@ -92,6 +105,8 @@ class EnvironmentObserver:
         entries = ", ".join(snapshot.top_level_entries)
         return (
             "Read-only local environment snapshot (facts may become stale):\n"
+            f"- Local date and time: {snapshot.local_datetime} ({snapshot.timezone_name}, {snapshot.utc_offset})\n"
+            f"- Observed in UTC: {snapshot.observed_at}\n"
             f"- Project: {snapshot.project_name}\n"
             f"- Working directory: {snapshot.working_directory}\n"
             f"- Runtime: Python {snapshot.python_version} on {snapshot.operating_system}\n"

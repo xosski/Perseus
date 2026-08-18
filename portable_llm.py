@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from html import unescape
 import ipaddress
 import json
 import logging
+import os
 from pathlib import Path
 import queue
 import re
@@ -135,48 +137,7 @@ except ImportError:
             temperature: float = 0.7,
             max_tokens: int = 2048,
         ) -> str:
-            user_prompt = _extract_user_request(prompt)
-            prompt_lower = user_prompt.lower()
-
-            if _is_capability_prompt(user_prompt):
-                return _capability_response()
-
-            if "ONLINE SEARCH CONTEXT" in (prompt or ""):
-                return _answer_from_online_search_context(prompt, user_prompt)
-
-            if "Ingested context:" in (prompt or ""):
-                return _answer_from_ingested_context(prompt, user_prompt)
-
-            general_answer = _general_knowledge_fallback(user_prompt)
-            if general_answer:
-                return general_answer
-
-            if _is_general_knowledge_prompt(user_prompt):
-                return _heuristic_general_answer(user_prompt)
-
-            if _is_small_talk_prompt(user_prompt):
-                if any(token in prompt_lower for token in ["how are you", "how's it going", "how is it going"]):
-                    return (
-                        "I'm doing alright - alert, local, and mildly annoyed that Ollama is not available, "
-                        "but still ready to help. Tell me what we're working on today."
-                    )
-                if any(token in prompt_lower for token in ["hello", "hi", "hey", "good morning", "good afternoon", "good evening"]):
-                    return "Hey - I'm here. Ask me anything, or point me at a file/folder and I'll work from it."
-                if "thank" in prompt_lower:
-                    return "You're welcome. Send the next thing when you're ready."
-
-                return "I'm here and ready. What would you like to dig into?"
-
-            return (
-                "Knowledge Response:\n"
-                "I do not have enough learned context to answer that with confidence yet. "
-                "Add trusted sites, feeds, URLs, or local files in Knowledge Ingest, then ask again and I will ground the answer in that material.\n\n"
-                "What to add:\n"
-                "- Primary documentation or official sources for the topic.\n"
-                "- High-signal news, security, reference, or research sources you trust.\n"
-                "- Local notes, project docs, or personal reference files.\n\n"
-                f"Request to ground: {user_prompt}"
-            )
+            return _portable_fallback_response(prompt)
 
 
     class ConversationManager:
@@ -1986,6 +1947,21 @@ def _sanitize_visible_response(response: Optional[str], prompt_payload: str = ""
     return text.strip()
 
 
+DETERMINISTIC_RESPONSE_PROVIDERS = {
+    "fallback",
+    "fallback-recovery",
+    "grounded-fallback",
+    "offline",
+    "search-grounded-fallback",
+}
+
+
+def _sanitize_selected_response(response: Optional[str], prompt_payload: str, provider: str) -> str:
+    """Sanitize selected output without deleting trusted deterministic text found in retrieved source code."""
+    echo_payload = "" if provider in DETERMINISTIC_RESPONSE_PROVIDERS else prompt_payload
+    return _sanitize_visible_response(response, prompt_payload=echo_payload)
+
+
 def _contains_internal_reasoning_leak(response: Optional[str]) -> bool:
     """Detect visible private reasoning/scaffolding that should never be shown to users."""
     lower = (response or "").lower()
@@ -2650,13 +2626,15 @@ class PortableLLM:
             logger.warning("Environment awareness module unavailable: %s", exc)
             return None
 
-    def _enrich_prompt_with_environment(self, enriched: EnrichedPrompt) -> EnrichedPrompt:
-        """Ground generation in a bounded, read-only runtime snapshot."""
+    def _enrich_prompt_with_environment(self, enriched: EnrichedPrompt, prompt: str = "") -> EnrichedPrompt:
+        """Expose runtime facts, counting them as grounding only when relevant."""
+        if _is_small_talk_prompt(prompt) or _is_capability_prompt(prompt):
+            return enriched
         observer = getattr(self, "environment_observer", None)
         if not observer:
             return enriched
         try:
-            context = observer.build_prompt_context().strip()
+            context = observer.build_prompt_context(prompt).strip()
         except Exception as exc:
             logger.warning("Environment observation failed: %s", exc)
             return enriched
@@ -2676,7 +2654,7 @@ class PortableLLM:
         )[:1800]
         return EnrichedPrompt(
             text=text,
-            has_context=enriched.has_context,
+            has_context=enriched.has_context or bool(_relevant_context_facts(prompt, context)),
             context_preview=preview,
         )
 
@@ -3054,7 +3032,8 @@ class PortableLLM:
             "User request:\n"
             f"{prompt}"
         )
-        return EnrichedPrompt(text=enriched_text, has_context=True, context_preview=preview)
+        # Comprehension analysis is planning guidance, not factual evidence.
+        return EnrichedPrompt(text=enriched_text, has_context=False, context_preview="")
 
     def available_providers(self) -> List[str]:
         """Return available providers from existing conversation core."""
@@ -3076,12 +3055,14 @@ class PortableLLM:
             return "Please provide a prompt.", {"error": "empty_prompt"}
 
         prompt = prompt.strip()
+        original_prompt = prompt
         if len(prompt) > MAX_PROMPT_CHARS:
             return (
                 f"Prompt is too large ({len(prompt)} characters). Please keep requests under {MAX_PROMPT_CHARS} characters.",
                 {"error": "prompt_too_large", "max_prompt_chars": MAX_PROMPT_CHARS},
             )
         self.stats.total_requests += 1
+        prompt = _resolve_contextual_followup(prompt, self.conversation.messages)
 
         if temperature is not None:
             self.conversation.temperature = _clamp_float(temperature, self.conversation.temperature, 0.0, 2.0)
@@ -3139,7 +3120,7 @@ class PortableLLM:
                 context_channels.append(channel)
             enriched = candidate
 
-        use_context("environment_snapshot", self._enrich_prompt_with_environment(enriched))
+        use_context("environment_snapshot", self._enrich_prompt_with_environment(enriched, prompt))
         use_context("dynamic_modules", self._enrich_prompt_with_dynamic_modules(enriched, prompt))
         use_context("cognitive_memory", self._enrich_prompt_with_cognitive_memory(enriched, prompt))
         use_context("knowledge_db", self._merge_enriched_prompts(enriched, self._enrich_prompt_with_knowledge(prompt)))
@@ -3147,10 +3128,13 @@ class PortableLLM:
         use_context("predictive_memory", self._enrich_prompt_with_predictive_modules(enriched, prompt))
         use_context("growth_learning", self._enrich_prompt_with_growth_learning(enriched, prompt))
         enriched = self._build_tri_channel_final_prompt(prompt, enriched, parser_packet, brain_meta)
+        user_metadata = {"intent": profile.intent, "complexity": profile.complexity}
+        if prompt != original_prompt:
+            user_metadata["resolved_prompt"] = prompt
         self.conversation.add_message(
             "user",
-            prompt,
-            metadata={"intent": profile.intent, "complexity": profile.complexity},
+            original_prompt,
+            metadata=user_metadata,
         )
         self.manager._save_conversation(self.conversation)
 
@@ -3193,16 +3177,38 @@ class PortableLLM:
             provider_used = "offline"
             quality = self._assess_quality(response, profile)
 
-        if enriched.has_context and response and quality.score < self._quality_threshold:
-            response = self._build_grounded_response(prompt=prompt, context=enriched.context_preview)
-            response = _sanitize_visible_response(response, prompt_payload=enriched.text)
-            provider_used = "grounded-fallback"
+        if not response:
+            response = _portable_fallback_response(enriched.text)
+            provider_used = "fallback-recovery"
+            quality = self._assess_quality(response, profile, has_context=enriched.has_context)
+            refined = True
+
+        if (
+            enriched.has_context
+            and response
+            and quality.score < self._quality_threshold
+            and not _response_covers_request(prompt, response)
+        ):
+            if "ONLINE SEARCH CONTEXT" in enriched.text:
+                response = _answer_from_online_search_context(enriched.text, prompt)
+                provider_used = "search-grounded-fallback"
+            else:
+                response = self._build_grounded_response(prompt=prompt, context=enriched.context_preview)
+                provider_used = "grounded-fallback"
+            response = _sanitize_visible_response(response)
             quality = self._assess_quality(response, profile, has_context=True)
             refined = True
 
-        sanitized_response = _sanitize_visible_response(response, prompt_payload=enriched.text)
+        sanitized_response = _sanitize_selected_response(
+            response, prompt_payload=enriched.text, provider=provider_used
+        )
         if response and sanitized_response != str(response).strip():
             response = sanitized_response
+            quality = self._assess_quality(response, profile, has_context=enriched.has_context)
+            refined = True
+        if not response:
+            response = _portable_fallback_response(enriched.text)
+            provider_used = "fallback-recovery"
             quality = self._assess_quality(response, profile, has_context=enriched.has_context)
             refined = True
 
@@ -3216,6 +3222,14 @@ class PortableLLM:
         )
         if introspection_changed:
             refined = True
+
+        if response and quality.score < self._quality_threshold and not _response_covers_request(prompt, response):
+            recovery_response = _portable_fallback_response(enriched.text)
+            if recovery_response and _response_covers_request(prompt, recovery_response):
+                response = recovery_response
+                provider_used = "fallback-recovery"
+                quality = self._assess_quality(response, profile, has_context=False)
+                refined = True
 
         # Ollama is the rare rescue path: only use it after the local/fallback answer,
         # grounding rescue, sanitizer, and introspection have all failed to clear the
@@ -3271,7 +3285,7 @@ class PortableLLM:
                         intent=profile.intent,
                         strategy=(brain_meta or {}).get("strategy", ""),
                         refined=refined,
-                        fallback_used=used_offline or provider_used == "grounded-fallback",
+                        fallback_used=used_offline or provider_used in {"fallback-recovery", "grounded-fallback", "search-grounded-fallback"},
                         introspection_changed=bool((introspection_meta or {}).get("changed_response")),
                     )
                 except Exception as exc:
@@ -3388,23 +3402,22 @@ class PortableLLM:
     @staticmethod
     def _build_grounded_response(prompt: str, context: str) -> str:
         """Deterministic rescue response when grounded output quality is too low."""
-        context_bullets = _context_preview_bullets(context)
-        bullet_text = "\n".join(f"- {item}" for item in context_bullets)
+        relevant_facts = _relevant_context_facts(prompt, context)
+        if relevant_facts:
+            primary = relevant_facts[0].rstrip(" .")
+            supporting = "\n".join(
+                f"- Additional relevant evidence: {fact.rstrip(' .')}."
+                for fact in relevant_facts[1:]
+            )
+            answer = (
+                f"Based on the current local environment and available knowledge, the relevant answer is: {primary}."
+            )
+            if supporting:
+                answer += f"\n\n{supporting}"
+            return answer
         return (
-            "Summary:\n"
-            "I found relevant learned context for this request. The safe answer is to use that context as the base, "
-            "separate confirmed details from assumptions, and turn the result into concrete next actions instead of guessing.\n\n"
-            "Ingested Context Used:\n"
-            f"{bullet_text or '- Relevant learned context was retrieved, but the preview was too small to summarize deterministically.'}\n\n"
-            "Reasoned Takeaway:\n"
-            "- What matters: answer from the retrieved facts first, then add interpretation only where the evidence supports it.\n"
-            "- Why it matters: this keeps Perseus useful without pretending a weak model response was stronger than it was.\n"
-            "- Uncertainty: if the retrieved context is incomplete, validate against primary docs, local files, or source material before relying on it.\n\n"
-            "Next Steps:\n"
-            "1. Ask a narrower follow-up naming the file, source, feature, or decision you want analyzed.\n"
-            "2. Add or ingest the missing source material if the context above is thin.\n"
-            "3. Use the model-backed path with Ollama running for a fuller synthesized answer.\n\n"
-            f"Original question: {prompt}"
+            "I could not find context that is actually relevant to this request. "
+            "The retrieved memory should not be treated as an answer; provide a more specific source or use an available model."
         )
 
     def get_stats(self) -> Dict[str, float]:
@@ -3503,6 +3516,70 @@ class PortableLLM:
         except Exception as exc:
             logger.warning("Autonomous training stats failed: %s", exc)
             return {"error": str(exc)}
+
+    def configure_session_provider(
+        self,
+        provider: str,
+        api_key: str = "",
+        model: Optional[str] = None,
+        endpoint: str = "",
+    ) -> Dict[str, object]:
+        """Configure and select a provider in memory without persisting credentials."""
+        provider = (provider or "").strip().lower()
+        supported = {"openai", "mistral", "azure", "ollama", "fallback"}
+        if provider not in supported:
+            return {"ok": False, "error": f"Unsupported provider: {provider or 'empty'}"}
+
+        cloud_environment = {
+            "openai": {"OPENAI_API_KEY": api_key, "OPENAI_BASE_URL": endpoint},
+            "mistral": {"MISTRAL_API_KEY": api_key},
+            "azure": {"AZURE_OPENAI_API_KEY": api_key, "AZURE_OPENAI_ENDPOINT": endpoint},
+        }
+        if provider in cloud_environment and not api_key.strip():
+            return {"ok": False, "error": f"{provider} requires an API key."}
+        if provider == "azure" and not endpoint.strip():
+            return {"ok": False, "error": "Azure OpenAI requires an endpoint URL."}
+
+        temporary_values = cloud_environment.get(provider, {})
+        previous_values = {name: os.environ.get(name) for name in temporary_values}
+        try:
+            for name, value in temporary_values.items():
+                if value.strip():
+                    os.environ[name] = value.strip()
+                else:
+                    os.environ.pop(name, None)
+            available = self.manager.reload_providers()
+        finally:
+            for name, previous in previous_values.items():
+                if previous is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = previous
+
+        if provider not in available:
+            return {
+                "ok": False,
+                "error": (
+                    f"{provider} could not be initialized. Check that its Python client package "
+                    "is installed and that the required configuration is valid."
+                ),
+                "available_providers": available,
+            }
+
+        previous_local_only = self.strict_local_only
+        if provider in cloud_environment:
+            self.strict_local_only = False
+        selected_model = (model or "").strip() or self._default_model_for(provider)
+        if not self.set_provider(provider, selected_model):
+            self.strict_local_only = previous_local_only
+            return {"ok": False, "error": f"Could not select provider {provider}."}
+        return {
+            "ok": True,
+            "provider": provider,
+            "model": selected_model,
+            "available_providers": available,
+            "credentials_persisted": False,
+        }
 
     def set_provider(self, provider: str, model: Optional[str] = None) -> bool:
         """Switch provider for the active conversation."""
@@ -3743,7 +3820,7 @@ class PortableLLM:
 
         prompt_text = (prompt or "").strip()
         response_text = (response or "").strip()
-        if not prompt_text:
+        if not prompt_text or quality.score < self._quality_threshold:
             return
 
         low_value_responses = [
@@ -4502,6 +4579,8 @@ class PortableLLM:
 
     def _enrich_prompt_with_predictive_modules(self, enriched: EnrichedPrompt, prompt: str) -> EnrichedPrompt:
         """Inject context from the three Modules/ learning engines when available."""
+        if _is_small_talk_prompt(prompt) or _is_capability_prompt(prompt):
+            return enriched
         module_context = self._build_predictive_module_context(prompt)
         if not module_context:
             return enriched
@@ -4570,41 +4649,62 @@ class PortableLLM:
         return EnrichedPrompt(text=enriched_text, has_context=True, context_preview=" | ".join(preview_parts)[:1800])
 
     def _enrich_prompt_with_online_search(self, enriched: EnrichedPrompt, prompt: str) -> EnrichedPrompt:
-        """Inject current online search context when local knowledge is missing or the prompt needs freshness."""
+        """Inject search evidence for each unresolved part of a potentially compound request."""
         searcher = getattr(self, "search_augmentation", None)
         if not searcher:
             return enriched
         if _is_small_talk_prompt(prompt) or _is_capability_prompt(prompt):
             return enriched
 
-        try:
-            decision = searcher.should_search(prompt, local_context=enriched.context_preview)
-        except Exception as exc:
-            logger.warning("Search decision failed: %s", exc)
+        requests = _split_compound_requests(prompt)
+        if not requests:
+            normalized_request = _normalize_request_wording(prompt)
+            normalized_request = re.sub(
+                r"^(?:hey|hello|hi)\b[\s,]*(?:perseus\b[\s,]*)?",
+                "",
+                normalized_request,
+                flags=re.I,
+            ).strip()
+            requests = [normalized_request or prompt]
+        search_blocks: List[str] = []
+        decision_reasons: List[str] = []
+        for request in requests:
+            # Context from modules, environment state, or unrelated memories must not
+            # suppress lookup merely because it exists. Only pass facts that overlap
+            # the request; the search module treats an empty value as unresolved.
+            relevant_facts = _relevant_context_facts(request, enriched.context_preview)
+            local_context = " | ".join(relevant_facts)
+            try:
+                decision = searcher.should_search(request, local_context=local_context)
+            except Exception as exc:
+                logger.warning("Search decision failed for request part %r: %s", request, exc)
+                continue
+            if not getattr(decision, "should_search", False):
+                continue
+            try:
+                search_context = searcher.search_and_build_context(request)
+            except Exception as exc:
+                logger.warning("Online search failed for request part %r: %s", request, exc)
+                continue
+            if not search_context:
+                continue
+            search_blocks.append(search_context)
+            decision_reasons.append(getattr(decision, "reason", "Online lookup requested"))
+
+        if not search_blocks:
             return enriched
 
-        if not getattr(decision, "should_search", False):
-            return enriched
-
-        try:
-            search_context = searcher.search_and_build_context(prompt)
-        except Exception as exc:
-            logger.warning("Online search failed: %s", exc)
-            return enriched
-
-        if not search_context:
-            return enriched
-
+        combined_search_context = "\n\n".join(search_blocks)
         enriched_text = (
-            "You have online search context for a current or unknown-information request. "
-            "Use it as internal evidence to analyze the request, not as text to display. "
+            "You have online search context for one or more current or unknown-information requests. "
+            "Use it as internal evidence to analyze every part of the request, not as text to display. "
             "Do not expose internal predictive/cognitive scaffolding, lookup payloads, context blocks, or raw snippets.\n\n"
             "RAW_CONTEXT_DO_NOT_OUTPUT_BEGIN\n"
-            f"Search decision: {getattr(decision, 'reason', 'Online lookup requested')}\n\n"
-            f"{search_context}\n"
+            f"Search decision: {'; '.join(dict.fromkeys(decision_reasons))}\n\n"
+            f"{combined_search_context}\n"
             "RAW_CONTEXT_DO_NOT_OUTPUT_END\n\n"
             "Output requirements:\n"
-            "1. Answer the user's request directly from the search context when possible.\n"
+            "1. Answer every independent part of the user's request.\n"
             "2. Synthesize and paraphrase; do not quote or paste source snippets/context verbatim.\n"
             "3. Include a short 'Sources consulted' note with domains or provider names only when useful.\n"
             "4. If the snippets are thin, say what is uncertain and suggest a narrower location/source check.\n"
@@ -4616,7 +4716,7 @@ class PortableLLM:
             part
             for part in [
                 enriched.context_preview,
-                search_context[:1200].replace("\n", " ").strip(),
+                combined_search_context[:1200].replace("\n", " ").strip(),
             ]
             if part
         ]
@@ -4638,16 +4738,17 @@ class PortableLLM:
         if _is_small_talk_prompt(prompt) or _is_capability_prompt(prompt):
             return enriched, ""
 
+        local_context = " | ".join(_relevant_context_facts(prompt, enriched.context_preview))
         try:
             decision = searcher.should_search(
                 prompt,
-                local_context=enriched.context_preview,
+                local_context=local_context,
                 draft_response=draft_response,
                 quality_score=quality.score,
             )
         except TypeError:
             try:
-                decision = searcher.should_search(prompt, local_context=enriched.context_preview)
+                decision = searcher.should_search(prompt, local_context=local_context)
             except Exception as exc:
                 logger.warning("Second-pass search decision failed: %s", exc)
                 return enriched, ""
@@ -4788,6 +4889,8 @@ class PortableLLM:
                 if remaining_chars <= 0:
                     break
 
+        if not _is_memory_prompt(prompt):
+            collected = [snippet for snippet in collected if not _is_chat_memory_source_text(snippet)]
         return "\n\n".join(collected).strip()
 
     def _lookup_all_knowledge_context(self) -> str:
@@ -4976,7 +5079,9 @@ class PortableLLM:
         input contract before any retrieval or answer synthesis happens.
         """
         text = re.sub(r"\s+", " ", (prompt or "")).strip()
-        lower = text.lower()
+        request_parts = _split_compound_requests(text)
+        analysis_text = " ".join(request_parts) if request_parts else _normalize_request_wording(text)
+        lower = analysis_text.lower()
         tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", lower)
         stop = MEMORY_RETRIEVAL_STOPWORDS | {
             "can",
@@ -4989,6 +5094,15 @@ class PortableLLM:
             "then",
             "user",
             "answer",
+            "and",
+            "hello",
+            "hey",
+            "how",
+            "perseus",
+            "please",
+            "tell",
+            "the",
+            "you",
         }
         focus_terms = [term for term in dict.fromkeys(tokens) if term not in stop][:12]
 
@@ -5018,7 +5132,11 @@ class PortableLLM:
             "complexity": profile.complexity,
             "mood": profile.mood,
             "expected_shape": answer_shape,
-            "question": "?" in text or lower.startswith(("what", "why", "how", "when", "where", "who", "can", "could", "would", "is", "are", "do", "does")),
+            "question": "?" in text or any(
+                part.lower().startswith(("what", "why", "how", "when", "where", "who", "can", "could", "would", "is", "are", "do", "does", "tell", "explain"))
+                for part in (request_parts or [analysis_text])
+            ),
+            "subrequests": request_parts,
             "coding": code_or_repo_request,
             "current": needs_current_info,
             "safety": safety_sensitive,
@@ -5187,6 +5305,8 @@ class PortableLLM:
         provider = self.manager.providers.get(provider_name)
         if not provider or not provider.available:
             return None
+        if provider_name == "fallback":
+            return _sanitize_visible_response(_portable_fallback_response(prompt)) or None
 
         messages = self._build_messages(prompt=prompt, profile=profile, refine=refine, prior_response=prior_response)
         model = self.model if provider_name == self.provider else self._default_model_for(provider_name)
@@ -5493,6 +5613,8 @@ class PortableLLM:
             "ollama": DEFAULT_OLLAMA_MODEL,
             "azure": DEFAULT_AZURE_DEPLOYMENT,
             "fallback": "fallback",
+            "search-grounded-fallback": "search-extractive",
+            "fallback-recovery": "fallback",
             "offline": "offline",
         }
         return model_map.get(provider, "fallback")
@@ -5580,8 +5702,101 @@ def launch_portable_llm_chat(
 
     chat_tab = ttk.Frame(tabs)
     ingest_tab = ttk.Frame(tabs)
+    providers_tab = ttk.Frame(tabs, padding=14)
     tabs.add(chat_tab, text="Chat")
     tabs.add(ingest_tab, text="Knowledge Ingest")
+    tabs.add(providers_tab, text="LLM Providers")
+
+    provider_names = ("openai", "mistral", "azure", "ollama", "fallback")
+    provider_var = tk.StringVar(value=llm.provider if llm.provider in provider_names else "openai")
+    provider_key_var = tk.StringVar()
+    provider_model_var = tk.StringVar(value=llm.model)
+    provider_endpoint_var = tk.StringVar()
+    provider_config_status_var = tk.StringVar(
+        value="Available now: " + ", ".join(llm.available_providers())
+    )
+
+    ttk.Label(providers_tab, text="Session LLM Provider", font=("Segoe UI", 12, "bold")).grid(
+        row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10)
+    )
+    ttk.Label(providers_tab, text="Provider:").grid(row=1, column=0, sticky=tk.W, pady=4)
+    provider_combo = ttk.Combobox(
+        providers_tab, textvariable=provider_var, values=provider_names, state="readonly", width=28
+    )
+    provider_combo.grid(row=1, column=1, sticky=tk.EW, pady=4)
+    ttk.Label(providers_tab, text="API key:").grid(row=2, column=0, sticky=tk.W, pady=4)
+    provider_key_entry = ttk.Entry(providers_tab, textvariable=provider_key_var, show="•")
+    provider_key_entry.grid(row=2, column=1, sticky=tk.EW, pady=4)
+    ttk.Label(providers_tab, text="Model / deployment:").grid(row=3, column=0, sticky=tk.W, pady=4)
+    provider_model_entry = ttk.Entry(providers_tab, textvariable=provider_model_var)
+    provider_model_entry.grid(row=3, column=1, sticky=tk.EW, pady=4)
+    provider_endpoint_label = ttk.Label(providers_tab, text="Base URL / Azure endpoint:")
+    provider_endpoint_label.grid(row=4, column=0, sticky=tk.W, pady=4)
+    provider_endpoint_entry = ttk.Entry(providers_tab, textvariable=provider_endpoint_var)
+    provider_endpoint_entry.grid(row=4, column=1, sticky=tk.EW, pady=4)
+    providers_tab.columnconfigure(1, weight=1)
+
+    provider_help = ttk.Label(
+        providers_tab,
+        text=(
+            "Keys are held in process memory for this session only and are never written to the conversation "
+            "database. Selecting a cloud provider sends prompts and relevant context to that provider. "
+            "OpenAI's optional Base URL supports OpenAI-compatible services."
+        ),
+        wraplength=760,
+        justify=tk.LEFT,
+    )
+    provider_help.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(10, 8))
+    ttk.Label(providers_tab, textvariable=provider_config_status_var, wraplength=760).grid(
+        row=7, column=0, columnspan=2, sticky=tk.W, pady=(8, 0)
+    )
+
+    def update_provider_fields(_event=None) -> None:
+        selected = provider_var.get()
+        defaults = {
+            "openai": DEFAULT_OPENAI_MODEL,
+            "mistral": DEFAULT_MISTRAL_MODEL,
+            "azure": DEFAULT_AZURE_DEPLOYMENT,
+            "ollama": DEFAULT_OLLAMA_MODEL,
+            "fallback": "fallback",
+        }
+        if _event is not None or not provider_model_var.get().strip():
+            provider_model_var.set(defaults[selected])
+        cloud = selected in {"openai", "mistral", "azure"}
+        provider_key_entry.configure(state=tk.NORMAL if cloud else tk.DISABLED)
+        endpoint_enabled = selected in {"openai", "azure"}
+        provider_endpoint_entry.configure(state=tk.NORMAL if endpoint_enabled else tk.DISABLED)
+        endpoint_label = "OpenAI-compatible base URL (optional):" if selected == "openai" else "Endpoint:"
+        if selected == "azure":
+            endpoint_label = "Azure endpoint:"
+        provider_endpoint_label.configure(text=endpoint_label)
+
+    def apply_provider_configuration() -> None:
+        selected = provider_var.get()
+        result = llm.configure_session_provider(
+            provider=selected,
+            api_key=provider_key_var.get(),
+            model=provider_model_var.get(),
+            endpoint=provider_endpoint_var.get(),
+        )
+        provider_key_var.set("")
+        if not result.get("ok"):
+            error = str(result.get("error") or "Provider configuration failed.")
+            provider_config_status_var.set(error)
+            messagebox.showerror("LLM Provider", error, parent=root)
+            return
+        provider_label.configure(text=f"Provider: {llm.provider} | Model: {llm.model}")
+        provider_config_status_var.set(
+            f"Active: {llm.provider} | model={llm.model} | API key persisted: no"
+        )
+        status_var.set(f"Ready | provider={llm.provider}")
+
+    provider_combo.bind("<<ComboboxSelected>>", update_provider_fields)
+    provider_apply_btn = ttk.Button(
+        providers_tab, text="Use Provider For This Session", command=apply_provider_configuration
+    )
+    provider_apply_btn.grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+    update_provider_fields()
 
     transcript = tk.Text(chat_tab, wrap=tk.WORD, font=("Consolas", 10), state=tk.DISABLED)
     transcript.pack(fill=tk.BOTH, expand=True, padx=0, pady=(0, 8))
@@ -6068,6 +6283,9 @@ def _build_folder_index_content(root: Path, files: List[Path], learned_titles: L
 def _extract_user_request(prompt: str) -> str:
     """Recover the original user request from an enriched prompt when present."""
     text = (prompt or "").strip()
+    marker = "User request to answer:"
+    if marker in text:
+        return text.rsplit(marker, 1)[1].strip()
     marker = "User request:"
     if marker in text:
         return text.rsplit(marker, 1)[1].strip()
@@ -6102,6 +6320,16 @@ def _is_capability_prompt(prompt: str) -> bool:
         "what do you do",
     ]
     return any(marker in lower for marker in capability_markers)
+
+
+def _is_chat_memory_source_text(text: str) -> bool:
+    lower = (text or "").lower()
+    return (
+        "chat-memory/" in lower
+        or "perseus://chat-memory/" in lower
+        or "learned chat interaction:" in lower
+        or ("memory categories:" in lower and "memory summary:" in lower)
+    )
 
 
 def _answer_from_ingested_context(prompt: str, user_prompt: str) -> str:
@@ -6150,7 +6378,7 @@ def _parse_ingested_context_sources(prompt: str) -> List[Dict[str, str]]:
     for match in pattern.finditer(context):
         title = re.sub(r"\s+", " ", match.group("title")).strip()
         content = re.sub(r"\s+", " ", match.group("content")).strip()
-        if title and content:
+        if title and content and not _is_chat_memory_source_text(f"{title}\n{content}"):
             sources.append({"title": title, "content": content})
     return sources
 
@@ -6229,13 +6457,208 @@ def _sentence_points_from_context(content: str, query_terms: set) -> List[str]:
     return ranked[:2]
 
 
+def _is_explanatory_request(text: str) -> bool:
+    lower = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    return bool(re.search(r"^(?:please )?(?:explain|how|why)\b|\bhow (?:does|do|did|can|is|are)\b", lower))
+
+
+def _requests_more_depth(text: str) -> bool:
+    lower = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    return bool(re.search(
+        r"\b(?:more|additional|further) (?:information|details?)\b|"
+        r"\b(?:elaborate|expand on|go deeper|continue explaining|in more detail)\b",
+        lower,
+    ))
+
+
+def _resolve_contextual_followup(prompt: str, messages: List[object]) -> str:
+    """Give an underspecified continuation the subject of the preceding user turn."""
+    text = re.sub(r"\s+", " ", (prompt or "")).strip()
+    lower = text.lower()
+    refers_back = _requests_more_depth(text) or bool(re.search(
+        r"^(?:and )?(?:why|how|what) (?:about |is |are |does |do |did |can )?"
+        r"(?:that|this|it|they|those|them)\b|^(?:continue|go on)\b",
+        lower,
+    ))
+    if not refers_back:
+        return text
+    # An explicit new subject wins over conversational history.
+    about_match = re.search(r"\babout\s+(.+)$", lower)
+    if about_match and not re.match(r"(?:that|this|it|them|those)\b", about_match.group(1)):
+        return text
+
+    previous_request = ""
+    for message in reversed(messages or []):
+        role = getattr(message, "role", "")
+        if role != "user":
+            continue
+        metadata = getattr(message, "metadata", {}) or {}
+        previous_request = str(metadata.get("resolved_prompt") or getattr(message, "content", "")).strip()
+        if previous_request:
+            break
+    if not previous_request:
+        return text
+
+    previous_request = _normalize_request_wording(previous_request).strip(" .?!")
+    topic = ""
+    topic_patterns = [
+        r"\bhow (?:does|do|did) (.+?) work$",
+        r"\b(?:what is|what are|who is|who are|tell me about|describe|explain(?: how)?) (.+)$",
+    ]
+    for pattern in topic_patterns:
+        match = re.search(pattern, previous_request, flags=re.I)
+        if match:
+            topic = match.group(1).strip(" .?!")
+            break
+    if not topic:
+        topic = re.sub(
+            r"^(?:hey|hello|hi)\b[\s,]*(?:perseus\b[\s,]*)?|"
+            r"^(?:(?:can|could|would) you )?(?:please )?(?:tell|show|give|explain) me\s+",
+            "",
+            previous_request,
+            flags=re.I,
+        ).strip(" .?!")
+    topic = re.sub(r"\s+in more detail$", "", topic, flags=re.I).strip()
+    if not topic or len(topic) > 240:
+        return text
+    return f"Explain {topic} in more detail."
+
+
+def _normalize_request_wording(text: str) -> str:
+    """Repair simple duplicated-letter and adjacent-transposition errors in request-control words."""
+    control_words = {
+        "change", "convert", "date", "explain", "give", "how", "into", "just",
+        "show", "tell", "time", "transform", "turn", "what", "when", "where", "which", "why",
+    }
+
+    def normalize_token(match: re.Match) -> str:
+        token = match.group(0)
+        lower = token.lower()
+        candidate = lower
+        if len(lower) > 3 and lower[0] == lower[1] and lower[1:] in control_words:
+            candidate = lower[1:]
+        elif lower not in control_words:
+            for index in range(len(lower) - 1):
+                swapped = lower[:index] + lower[index + 1] + lower[index] + lower[index + 2:]
+                if swapped in control_words:
+                    candidate = swapped
+                    break
+        if token[:1].isupper():
+            candidate = candidate.capitalize()
+        return candidate
+
+    return re.sub(r"\b[a-zA-Z]{3,}\b", normalize_token, text or "")
+
+
+def _split_compound_requests(user_prompt: str) -> List[str]:
+    """Split independently answerable clauses joined by an explicit request cue."""
+    text = re.sub(r"\s+", " ", (user_prompt or "")).strip(" ,")
+    text = re.sub(
+        r"^(?:hey|hello|hi)\b[\s,]*(?:perseus\b[\s,]*)?",
+        "",
+        text,
+        flags=re.I,
+    )
+    parts = re.split(
+        r"\s+(?:and|also|then)\s+(?=(?:can|could|would|tell|explain|show|give|what|why|how|when|where|who|is|are|do|does|please)\b)",
+        text,
+        flags=re.I,
+    )
+    cleaned = [_normalize_request_wording(part.strip(" ,")) for part in parts if part.strip(" ,")]
+    return cleaned if len(cleaned) > 1 else []
+
+
+def _answer_from_environment_context(prompt: str, request: str) -> str:
+    """Answer a runtime date/time clause from the hidden environment snapshot."""
+    request_terms = set(re.findall(r"[a-z]+", (request or "").lower()))
+    if not request_terms.intersection({"date", "time"}):
+        return ""
+    match = re.search(r"Local date and time:\s*([^\r\n]+)", prompt or "", flags=re.I)
+    if not match:
+        return ""
+    return f"Local date and time: {match.group(1).strip()}."
+
+
+def _answer_compound_request(prompt: str, user_prompt: str) -> str:
+    """Compose deterministic clause answers when the active provider cannot reason across them."""
+    requests = _split_compound_requests(user_prompt)
+    if not requests:
+        return ""
+
+    answers: List[str] = []
+    for request in requests:
+        answer = _answer_from_environment_context(prompt, request)
+        if not answer:
+            answer = _general_knowledge_fallback(request) or ""
+        if not answer and "ONLINE SEARCH CONTEXT" in (prompt or ""):
+            answer = _answer_from_online_search_context(prompt, request)
+        if not answer:
+            return ""
+        answers.append(answer.strip())
+
+    return "\n\n".join(f"{index}. {answer}" for index, answer in enumerate(answers, start=1))
+
+
+def _format_transformation_ambiguity(source_term: str, target_term: str) -> str:
+    source_words = re.findall(r"[a-z0-9]+", source_term.lower())
+    target_words = re.findall(r"[a-z0-9]+", target_term.lower())
+    if len(target_words) > len(source_words) and target_words[-len(source_words):] == source_words:
+        return (
+            f"As worded, {source_term} names a broad category rather than one defined starting "
+            f"substance; {target_term} is one specific kind in that category. Name the exact "
+            "starting material before a conversion method can be determined safely and accurately."
+        )
+    return (
+        f"As worded, no distinct conversion is defined: {source_term} is already a kind of "
+        f"{target_term}. If you mean a different end product or property, name that endpoint "
+        "so the method can be evaluated safely and accurately."
+    )
+
+
+def _portable_fallback_response(prompt: str) -> str:
+    """Generate a nonempty deterministic answer from the actual user request and available evidence."""
+    user_prompt = _normalize_request_wording(_extract_user_request(prompt))
+
+    compound_answer = _answer_compound_request(prompt, user_prompt)
+    if compound_answer:
+        return compound_answer
+    if _is_capability_prompt(user_prompt):
+        return _capability_response()
+    if "ONLINE SEARCH CONTEXT" in (prompt or ""):
+        return _answer_from_online_search_context(prompt, user_prompt)
+
+    ambiguity = _transformation_ambiguity(user_prompt)
+    if ambiguity:
+        return _format_transformation_ambiguity(*ambiguity)
+    if "Ingested context:" in (prompt or ""):
+        return _answer_from_ingested_context(prompt, user_prompt)
+
+    general_answer = _general_knowledge_fallback(user_prompt)
+    if general_answer:
+        return general_answer
+    if _is_general_knowledge_prompt(user_prompt):
+        return _heuristic_general_answer(user_prompt)
+    if _is_small_talk_prompt(user_prompt):
+        lower = user_prompt.lower()
+        if any(token in lower for token in ["how are you", "how's it going", "how is it going"]):
+            return "I'm doing alright — awake, local, and ready to help. What are we working on?"
+        if "thank" in lower:
+            return "You're welcome."
+        return "Hey — I'm here. What would you like to work on?"
+
+    return (
+        "I could not produce a supportable answer from the available local model or retrieved evidence. "
+        "Clarify the requested outcome, or start an available generative provider for broader synthesis."
+    )
+
+
 def _answer_from_online_search_context(prompt: str, user_prompt: str) -> str:
     """Create a compact source-grounded answer when only the local fallback provider is available."""
     results = _parse_online_search_results(prompt)
     if not results:
         return (
-            "I tried an online lookup, but the search context did not return usable source snippets. "
-            "Try a more specific location, source, or topic so I can look up a narrower answer."
+            "Online lookup was available, but it returned no usable evidence for this question. "
+            "A narrower topic or a named source may produce a supportable answer."
         )
 
     weather_like = "weather" in user_prompt.lower() or "forecast" in user_prompt.lower()
@@ -6244,22 +6667,74 @@ def _answer_from_online_search_context(prompt: str, user_prompt: str) -> str:
         if weather_answer:
             return weather_answer
 
-    synthesized_points = _synthesize_lookup_points(results, user_prompt)
+    ambiguity = _transformation_ambiguity(user_prompt)
+    if ambiguity:
+        source_term, target_term = ambiguity
+        synthesized_points = _synthesize_lookup_points(
+            results, source_term, minimum_term_overlap=2
+        )
+    else:
+        explanatory = _is_explanatory_request(user_prompt)
+        max_points = 5 if explanatory or _requests_more_depth(user_prompt) else 3
+        synthesized_points = _synthesize_lookup_points(results, user_prompt, max_points=max_points)
+    source_note = _format_cited_source_note(synthesized_points) or _format_source_note(results)
+
+    if ambiguity:
+        lead = _format_transformation_ambiguity(source_term, target_term)
+        if not synthesized_points:
+            return f"{lead}\n\nSources consulted: {source_note}."
+        evidence = "\n".join(f"- {point}" for point in synthesized_points[:2])
+        return f"{lead}\n\nRelevant source evidence:\n{evidence}\n\nSources consulted: {source_note}."
+
     if not synthesized_points:
         return (
-            "I found online results, but their snippets were too thin to answer confidently. "
-            "Try narrowing the request or asking for a specific source."
+            "The online results were related to the topic, but they did not contain enough clean, "
+            "direct evidence to support an answer. Try narrowing the requested fact or naming a primary source."
         )
 
-    source_note = _format_source_note(results)
+    if _is_explanatory_request(user_prompt):
+        overview = synthesized_points[0]
+        details = synthesized_points[1:]
+        explanation = f"Overview: {overview}"
+        if details:
+            numbered = "\n".join(f"{index}. {point}" for index, point in enumerate(details, start=1))
+            explanation += f"\n\nMechanism and details:\n{numbered}"
+        return f"{explanation}\n\nSources consulted: {source_note}."
 
     return (
-        f"Answer:\n{chr(10).join(f'- {point}' for point in synthesized_points)}\n\n"
-        f"Sources consulted: {source_note}.\n\n"
-        "Confidence note: I synthesized the online lookup evidence rather than showing the raw retrieved text. "
-        "If this is high-stakes or very current, verify against the primary source."
+        f"Answer from the available source evidence:\n{chr(10).join(f'- {point}' for point in synthesized_points)}\n\n"
+        f"Sources consulted: {source_note}."
     )
 
+def _transformation_ambiguity(user_prompt: str) -> Optional[Tuple[str, str]]:
+    """Detect a linguistically nested source/target in a requested transformation."""
+    text = re.sub(r"\s+", " ", (user_prompt or "")).strip(" .?!")
+    match = re.search(
+        r"\b(?:convert|transform|change|turn)\s+(?P<source>.+?)\s+(?:in)?to\s+(?P<target>.+)$",
+        text,
+        flags=re.I,
+    )
+    if not match:
+        return None
+
+    def clean_phrase(value: str) -> str:
+        value = re.sub(r"^(?:a|an|the|some|just)\s+", "", value.strip(), flags=re.I)
+        value = re.sub(r"\s+(?:please|for me)$", "", value, flags=re.I)
+        return value.strip(" .?!")
+
+    source = clean_phrase(match.group("source"))
+    target = clean_phrase(match.group("target"))
+    source_words = re.findall(r"[a-z0-9]+", source.lower())
+    target_words = re.findall(r"[a-z0-9]+", target.lower())
+    if not source_words or not target_words or len(target_words) > 3:
+        return None
+    if (
+        source_words == target_words
+        or source_words[-len(target_words):] == target_words
+        or target_words[-len(source_words):] == source_words
+    ):
+        return source, target
+    return None
 
 def _synthesize_weather_lookup(results: List[Dict[str, str]], user_prompt: str) -> str:
     """Turn the structured wttr.in weather snippet into a direct answer without exposing raw context."""
@@ -6292,49 +6767,129 @@ def _synthesize_weather_lookup(results: List[Dict[str, str]], user_prompt: str) 
     return ""
 
 
-def _synthesize_lookup_points(results: List[Dict[str, str]], user_prompt: str, max_points: int = 3) -> List[str]:
-    """Create concise evidence-based points without dumping the raw lookup snippets."""
-    query_terms = {
+def _synthesize_lookup_points(
+    results: List[Dict[str, str]],
+    user_prompt: str,
+    max_points: int = 3,
+    minimum_term_overlap: int = 1,
+) -> List[str]:
+    """Select concise, relevant source statements without exposing lookup wrappers or page chrome."""
+    ignored_query_terms = {
+        "about", "could", "does", "into", "lookup", "online", "please", "search", "someone",
+        "tell", "what", "when", "where", "which", "work", "would",
+    }
+    query_tokens = [
         token
         for token in re.findall(r"[a-z0-9']+", (user_prompt or "").lower())
-        if len(token) > 3 and token not in {"what", "when", "where", "which", "about", "lookup", "search", "online"}
+        if len(token) > 3 and token not in ignored_query_terms
+    ]
+    query_terms = set(query_tokens)
+    # Search engines often repair a technical term that the user split into two
+    # words. Match adjacent joined forms as well as the original tokens.
+    query_forms = query_terms | {
+        query_tokens[index] + query_tokens[index + 1]
+        for index in range(len(query_tokens) - 1)
     }
-    points: List[str] = []
-    seen = set()
+    title_term_counts: Dict[str, int] = {}
     for item in results[:5]:
+        for title_term in set(re.findall(r"[a-z0-9']+", item.get("title", "").lower())):
+            if len(title_term) >= 7:
+                title_term_counts[title_term] = title_term_counts.get(title_term, 0) + 1
+    # Repeated result titles are strong evidence of the search engine's spelling
+    # correction. Accept a looser whole-term match only when independent results agree.
+    corrected_forms = {
+        title_term
+        for title_term, count in title_term_counts.items()
+        if count >= 2 and any(
+            len(query_form) >= 8
+            and abs(len(query_form) - len(title_term)) <= 3
+            and SequenceMatcher(None, query_form, title_term).ratio() >= 0.72
+            for query_form in query_forms
+        )
+    }
+    query_forms.update(corrected_forms)
+
+    def matched_query_terms(candidate_terms: set) -> set:
+        matches = set()
+        for query_term in query_forms:
+            if query_term in candidate_terms:
+                matches.add(query_term)
+                continue
+            if len(query_term) < 5:
+                continue
+            if any(
+                abs(len(query_term) - len(candidate)) <= 1
+                and len(candidate) >= 5
+                and SequenceMatcher(None, query_term, candidate).ratio() >= 0.86
+                for candidate in candidate_terms
+            ):
+                matches.add(query_term)
+        return matches
+
+    explanatory_request = _is_explanatory_request(user_prompt)
+    mechanism_terms = {
+        "because", "causes", "consists", "converts", "creates", "drives", "electric", "energy",
+        "allows", "direction", "field", "flows", "forces", "ions", "membrane", "moves", "negative",
+        "opposite", "passes", "positive", "process", "produces", "removes", "through", "transfers", "uses",
+    }
+    candidates: List[Tuple[int, int, int, str, Dict[str, str]]] = []
+    for position, item in enumerate(results[:5]):
         snippet = _clean_lookup_text(item.get("snippet", ""))
         title = _clean_lookup_text(item.get("title", ""))
         if not snippet:
             continue
+        title_terms = set(re.findall(r"[a-z0-9']+", title.lower()))
+        title_overlap = matched_query_terms(title_terms)
+        for sentence_position, sentence in enumerate(re.split(r"(?<=[.!?])\s+", snippet)):
+            sentence = sentence.strip()
+            if len(sentence) < 30 or _looks_like_web_page_chrome(sentence):
+                continue
+            sentence_terms = set(re.findall(r"[a-z0-9']+", sentence.lower()))
+            overlap = matched_query_terms(sentence_terms)
+            mechanism_score = len(mechanism_terms.intersection(sentence_terms))
+            required_overlap = min(len(query_terms), max(1, int(minimum_term_overlap)))
+            title_supports_mechanism = bool(explanatory_request and title_overlap and mechanism_score)
+            if query_terms and len(overlap) < required_overlap and not title_supports_mechanism:
+                continue
+            combined_overlap = overlap | title_overlap
+            if corrected_forms and not corrected_forms.intersection(combined_overlap):
+                continue
+            score = len(overlap) * 10 + len(title_overlap) * 3 + min(mechanism_score, 4) * 2
+            candidates.append((score, -position, -sentence_position, sentence, item))
 
-        sentences = re.split(r"(?<=[.!?])\s+", snippet)
-        ranked = sorted(
-            [sentence.strip() for sentence in sentences if len(sentence.strip()) >= 30],
-            key=lambda sentence: len(query_terms.intersection(set(re.findall(r"[a-z0-9']+", sentence.lower())))),
-            reverse=True,
-        )
-        chosen = ranked[0] if ranked else snippet
-        chosen = _shorten_lookup_point(chosen)
+    points: List[str] = []
+    seen = set()
+    source_counts: Dict[str, int] = {}
+    for _score, _position, _sentence_position, sentence, item in sorted(candidates, reverse=True):
+        chosen = _shorten_lookup_point(sentence)
         if not chosen:
             continue
-
         domain = _domain_from_lookup_item(item)
-        prefix = f"{title}: " if title and title.lower() not in chosen.lower() else ""
-        point = f"{prefix}{chosen}"
-        if domain:
-            point = f"{point} ({domain})"
-        key = re.sub(r"\W+", "", point.lower())[:120]
+        if domain and source_counts.get(domain, 0) >= 3:
+            continue
+        key = re.sub(r"\W+", "", chosen.lower())[:120]
         if key in seen:
             continue
         seen.add(key)
-        points.append(point)
+        if domain:
+            source_counts[domain] = source_counts.get(domain, 0) + 1
+        points.append(f"{chosen} ({domain})" if domain else chosen)
         if len(points) >= max_points:
             break
     return points
 
 
+def _looks_like_web_page_chrome(text: str) -> bool:
+    lower = (text or "").lower()
+    markers = [
+        "jump to content", "main menu", "move to sidebar", "create account", "log in",
+        "site search", "skip to main content", "contact us", "privacy policy",
+    ]
+    return sum(marker in lower for marker in markers) >= 2
+
 def _clean_lookup_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", unescape(text or "")).strip()
+    text = re.sub(r"\bPage excerpt:\s*", ". ", unescape(text or ""), flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip()
     return text.strip(" \t\r\n-•")
 
 
@@ -6344,6 +6899,17 @@ def _shorten_lookup_point(text: str, max_chars: int = 220) -> str:
         return text
     shortened = text[:max_chars].rsplit(" ", 1)[0].strip(" ,;:-")
     return f"{shortened}..." if shortened else ""
+
+
+def _format_cited_source_note(points: List[str], max_sources: int = 4) -> str:
+    labels: List[str] = []
+    for point in points:
+        match = re.search(r"\(([^()\s]+)\)$", point.strip())
+        if match and match.group(1) not in labels:
+            labels.append(match.group(1))
+        if len(labels) >= max_sources:
+            break
+    return ", ".join(labels)
 
 
 def _format_source_note(results: List[Dict[str, str]], max_sources: int = 4) -> str:
@@ -6390,11 +6956,11 @@ def _parse_online_search_results(prompt: str) -> List[Dict[str, str]]:
     """Parse SearchAugmentation's compact context block into title/source/snippet items."""
     text = prompt or ""
     pattern = re.compile(
-        r"^\d+\.\s*(?P<title>.*?)\n"
-        r"\s*Source:\s*(?P<source>.*?)\n"
-        r"\s*URL:\s*(?P<url>.*?)\n"
-        r"\s*Retrieved:\s*(?P<retrieved>.*?)\n"
-        r"\s*Snippet:\s*(?P<snippet>.*?)(?=\n\d+\.\s|\nInstruction:|\Z)",
+        r"^\d+\.[ \t]*(?P<title>[^\n]*)\n"
+        r"[ \t]*Source:[ \t]*(?P<source>[^\n]*)\n"
+        r"[ \t]*URL:[ \t]*(?P<url>[^\n]*)\n"
+        r"[ \t]*Retrieved:[ \t]*(?P<retrieved>[^\n]*)\n"
+        r"[ \t]*Snippet:[ \t]*(?P<snippet>.*?)(?=\n\s*\d+\.\s|\nInstruction:|\Z)",
         flags=re.MULTILINE | re.DOTALL,
     )
     results: List[Dict[str, str]] = []
@@ -6513,6 +7079,68 @@ def _context_preview_bullets(context: str, max_bullets: int = 6) -> List[str]:
         if len(bullets) >= max_bullets:
             break
     return bullets
+
+
+def _response_covers_request(prompt: str, response: str) -> bool:
+    """Require each request clause's substantive terms before grounding may replace an answer."""
+    if not (response or "").strip():
+        return False
+    requests = _split_compound_requests(prompt) or [_normalize_request_wording(_extract_user_request(prompt))]
+    response_terms = set(re.findall(r"[a-z0-9]+", response.lower()))
+    control_terms = MEMORY_RETRIEVAL_STOPWORDS | {
+        "and", "can", "change", "convert", "could", "explain", "give", "hello", "help",
+        "hey", "how", "into", "just", "perseus", "please", "show", "tell", "the",
+        "transform", "turn", "what", "when", "where", "which", "why", "would", "you",
+    }
+    for request in requests:
+        request_terms = {
+            term for term in re.findall(r"[a-z0-9]+", request.lower())
+            if len(term) > 2 and term not in control_terms
+        }
+        if not request_terms:
+            continue
+        required = min(2, len(request_terms))
+        if len(request_terms.intersection(response_terms)) < required:
+            return False
+    return True
+
+
+def _relevant_context_facts(prompt: str, context: str, limit: int = 4) -> List[str]:
+    """Rank factual context fragments by lexical relevance to the live request."""
+    stopwords = MEMORY_RETRIEVAL_STOPWORDS | {
+        "and", "can", "could", "give", "hello", "help", "hey", "how", "just", "perseus", "please",
+        "show", "tell", "the", "what", "when", "where", "which", "would", "you",
+    }
+    prompt_terms = {
+        term for term in re.findall(r"[a-z][a-z0-9_-]{2,}", (prompt or "").lower())
+        if term not in stopwords
+    }
+    if not prompt_terms:
+        return []
+
+    flattened = re.sub(r"\s+", " ", (context or "").strip())
+    fragments = re.split(r"\s+\|\s+|(?=\s+-\s+[A-Z][^:]{1,50}:)", flattened)
+    ranked = []
+    seen = set()
+    for position, fragment in enumerate(fragments):
+        fact = fragment.strip(" -|;,")
+        if len(fact) < 12:
+            continue
+        # Context wrappers can guide generation but are never facts suitable for display.
+        if _contains_internal_reasoning_leak(fact):
+            continue
+        fact_terms = set(re.findall(r"[a-z][a-z0-9_-]{2,}", fact.lower()))
+        overlap = prompt_terms & fact_terms
+        if not overlap:
+            continue
+        key = fact.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ranked.append((len(overlap), -position, fact[:350]))
+
+    ranked.sort(reverse=True)
+    return [fact for _score, _position, fact in ranked[: max(1, int(limit))]]
 
 
 def _format_prediction_packet(label: str, packet: Dict[str, object]) -> str:

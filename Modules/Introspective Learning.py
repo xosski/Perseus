@@ -262,6 +262,16 @@ class IntrospectiveLearning:
         ]
         return any(marker in response for marker in markers)
 
+    @staticmethod
+    def _request_parts(prompt: str) -> List[str]:
+        """Return independently answerable clauses marked by explicit conjunction cues."""
+        parts = re.split(
+            r"\s+(?:and|also|then)\s+(?=(?:can|could|would|tell|explain|show|give|what|why|how|when|where|who|is|are|do|does|please)\b)",
+            re.sub(r"\s+", " ", prompt or "").strip(),
+            flags=re.I,
+        )
+        return [part.strip(" ,") for part in parts if part.strip(" ,")]
+
     def _looks_like_answer(self, prompt: str, response: str) -> bool:
         if not response.strip():
             return False
@@ -271,10 +281,18 @@ class IntrospectiveLearning:
         if self._is_small_talk(prompt):
             return len(response.split()) >= 3
 
+        response_terms = set(re.findall(r"\b[a-z0-9][a-z0-9_-]{2,}\b", response))
+        request_parts = self._request_parts(prompt)
+        if len(request_parts) > 1:
+            for part in request_parts:
+                part_terms = set(self._important_terms(part))
+                if part_terms and not part_terms.intersection(response_terms):
+                    return False
+            return True
+
         prompt_terms = self._important_terms(prompt)
         if not prompt_terms:
             return len(response.split()) >= 8
-        response_terms = set(re.findall(r"\b[a-z0-9][a-z0-9_-]{2,}\b", response))
         overlap = len(set(prompt_terms) & response_terms)
         return overlap >= 1 or len(response.split()) >= 30
 
@@ -287,7 +305,9 @@ class IntrospectiveLearning:
         ]
         if lower in markers:
             return True
-        if len(lower.split()) <= 8 and any(marker in lower for marker in markers if " " in marker):
+        if len(lower.split()) > 8:
+            return False
+        if any(marker in lower for marker in markers if " " in marker):
             return True
         words = set(re.findall(r"[a-z']+", lower))
         return bool(words & {"hi", "hello", "hey", "yo", "thanks"})
