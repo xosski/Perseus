@@ -28,6 +28,8 @@ Perseus now includes a broader set of modules under `Modules/`. These modules ar
 | `cognitive_memory.py` | `CognitiveLayer`, `MemoryAnalyzer` | Hades-compatible durable vector memory that compares recent chat focus with recalled long-term context. |
 | `environment_awareness.py` | `EnvironmentObserver` | Bounded, read-only project/runtime snapshots used by active cognition before planning. |
 | `Introspective Learning.py` | `IntrospectiveLearning` | Post-response critique and repair layer that catches weak answers, scaffold leakage, and internal reasoning exposure. |
+| `response_rationale.py` | `ResponseRationale` | Persists inspectable evidence for why a response was selected: active context channels, contributing modules, provider/model, quality, strategy, and repairs. It does not expose or claim private chain-of-thought. |
+| `self_code_module.py` | `SelfCodeModule` | Optional workspace-confined, staged self-code updates. Excluded from startup loading and enabled only after explicit user consent; every apply requires a second approval. |
 | `Autonomous Training.py` | `AutonomousTrainingMemory` | Captures high-quality interactions as candidate supervised-training examples and exports clean JSONL datasets. |
 | `Monday personality.py` | `build_monday_prompt()` | Optional Monday-style personality prompt builder. |
 | `Monday Cook.py` | `build_monday_prompt()`, `build_task_wrapper()` | Alternate Monday prompt/wrapper helpers and example message formatting. |
@@ -46,6 +48,7 @@ The modules store their local state in SQLite databases beside the code by defau
 - `ghostcore_echowiring_memory.db` - EchoWiring/asynchronous memory
 - `ghostcore_cognitive_state.db` - cognitive traces and snapshots
 - `introspective_learning.db` - critique/repair traces
+- `perseus_response_rationale.db` - observable response-selection evidence and hashes
 - `perseus_autonomous_training.db` - accepted/rejected training examples and model-candidate metadata
 
 ### Three Memory Channels
@@ -84,6 +87,9 @@ Each canonical memory includes `revision`, `created_at`, `updated_at`, `source_t
 - Strict local-only mode by default: local fallback first, then Ollama as a rescue provider, with remote providers blocked unless non-strict mode is enabled
 - Persistent self-improvement memory that learns from prior quality failures and injects corrective directives
 - Runtime metrics for provider behavior, quality, fallbacks, refinements, module status, and autonomous-training capture
+- A response rationale for each successful answer, available with `/why`, the desktop **Why?** button, response metadata, or `get_last_response_rationale()`
+
+The response rationale explains the recorded pipeline evidence that influenced selection. It deliberately does not present generated chain-of-thought as ground truth or claim complete access to model internals.
 
 ## Knowledge Learning Behavior
 
@@ -270,9 +276,22 @@ llm.save_source_sites([
 source_result = llm.ingest_source_sites()
 print(source_result)
 
-# Inspect dynamic modules and runtime statistics.
+# Inspect dynamic modules, runtime statistics, and the latest response rationale.
 print(llm.list_loaded_modules())
 print(llm.get_stats())
+print(llm.get_last_response_rationale())
+
+# Self-code is OFF by default. A host must obtain user consent before enabling it.
+print(llm.enable_self_code(user_approved=True))
+proposal = llm.stage_self_update(
+    "Modules/example_module.py",
+    "VALUE = 1\n",
+    rationale="Add an approved local module",
+)
+print(proposal["diff"])
+# Ask the user to review the diff, then make a separate approval call.
+result = llm.apply_self_update(proposal["proposal_id"], user_approved=True)
+print(result)
 
 # Export module-managed state when available.
 print(llm.export_brain_state())
@@ -306,6 +325,8 @@ from portable_llm import PortableLLM
 - Files and folders such as `__pycache__`, `.git`, `.venv`, `venv`, `env`, and `node_modules` are skipped.
 - A module can contribute hidden prompt context by exposing a compatible object/function such as `MODULE_INSTANCE`, `build_prompt_context(prompt)`, `get_prompt_context(prompt)`, `get_context(prompt)`, or `analyze(prompt)`.
 - Module context is treated as hidden scaffolding. User-visible responses should not mention raw module names, hidden context blocks, chain-of-thought, scratchpads, or internal reasoning unless the user explicitly asks to inspect modules.
+- `self_code_module.py` is a deliberate exception to normal startup scanning. The desktop and terminal launchers ask after startup whether to load it for that session. Declining leaves it unimported.
+- Enabling self-code does not authorize writes. Updates are workspace-relative, extension-limited, syntax-checked, staged as unified diffs, and applied only through a separate explicit approval; existing files are backed up first. Python changes require a restart before the running process uses them.
 - `Perseus_Memory_Orchestrator.py` is useful as a reference/optional wrapper, but `portable_llm.py` already performs the main orchestration internally.
 
 ## Safety, Privacy, and Transparency Notes
@@ -315,6 +336,8 @@ from portable_llm import PortableLLM
 - `--no-chat-learning` disables durable learning from chat turns into the web learner, predictive memory, EchoWiring memory, cognitive memory, and autonomous-training capture.
 - `--no-online-search` disables online search augmentation for sessions that must remain fully offline.
 - Strict local-only mode blocks remote providers unless `--allow-fallbacks` is explicitly used.
+- Response rationale records observable pipeline evidence and content hashes, not raw prompt/response copies or private chain-of-thought.
+- The self-code module is excluded from startup import, requires session opt-in, and requires separate approval for every staged filesystem change.
 
 ## Portability Notes
 

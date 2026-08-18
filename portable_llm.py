@@ -540,6 +540,9 @@ MODULE_DYNAMIC_LOAD_EXCLUDE_FILES = {
     # ai_dashboard is also a standalone Flask/SocketIO app; importing it initializes
     # app state and attempts optional HadesAI wiring that is unrelated to chat prompts.
     "ai_dashboard.py",
+    # This capability can write project files. It must only be imported after startup
+    # when the user explicitly opts in for the current session.
+    "self_code_module.py",
 }
 PREDICTIVE_LEARNING_MODULE_FILE = "Predictive learning.py"
 PREDICTIVE_LEARNING_MODULE_FALLBACK_FILE = "Predictive learning.txt"
@@ -555,6 +558,8 @@ ENGLISH_LANGUAGE_MODULE_FILE = "English Language.py"
 ENGLISH_LANGUAGE_MODULE_FALLBACK_FILE = "English Language.txt"
 AUTONOMOUS_TRAINING_MODULE_FILE = "Autonomous Training.py"
 INTROSPECTIVE_LEARNING_MODULE_FILE = "Introspective Learning.py"
+RESPONSE_RATIONALE_MODULE_FILE = "response_rationale.py"
+SELF_CODE_MODULE_FILE = "self_code_module.py"
 BRAIN_STATE_DB_PATH = "brain_state_memory.db"
 PREDICTIVE_LEARNING_DB_PATH = "predictive_learning_memory.db"
 ECHOWIRING_MEMORY_DB_PATH = "ghostcore_echowiring_memory.db"
@@ -562,6 +567,7 @@ COGNITIVE_STATE_DB_PATH = "ghostcore_cognitive_state.db"
 SEARCH_CACHE_DB_PATH = "llm_search_cache.db"
 AUTONOMOUS_TRAINING_DB_PATH = "perseus_autonomous_training.db"
 INTROSPECTIVE_LEARNING_DB_PATH = "introspective_learning.db"
+RESPONSE_RATIONALE_DB_PATH = "perseus_response_rationale.db"
 SUPPORTED_KNOWLEDGE_EXTENSIONS = {
     ".txt",
     ".md",
@@ -2064,7 +2070,10 @@ class PortableLLM:
         self.english_language_engine = self._create_english_language_engine()
         self.autonomous_trainer = self._create_autonomous_trainer()
         self.introspective_learning = self._create_introspective_learning()
+        self.response_rationale = self._create_response_rationale()
+        self.self_code = None
         self.dynamic_module_engines = self._create_dynamic_module_engines()
+        self._last_dynamic_context_modules: List[str] = []
         self._active_brain_action = None
         self._active_brain_context = ""
 
@@ -2477,6 +2486,7 @@ class PortableLLM:
 
     def _enrich_prompt_with_dynamic_modules(self, enriched: EnrichedPrompt, prompt: str) -> EnrichedPrompt:
         """Inject hidden context from all dynamically loaded module engines."""
+        self._last_dynamic_context_modules = []
         if _is_small_talk_prompt(prompt) or _is_capability_prompt(prompt):
             return enriched
 
@@ -2499,6 +2509,7 @@ class PortableLLM:
             if not block:
                 continue
             block = block[:2500]
+            self._last_dynamic_context_modules.append(name)
             context_blocks.append(f"Module: {name}\n{block}")
             if len(context_blocks) >= 8:
                 break
@@ -2586,6 +2597,8 @@ class PortableLLM:
                 "autonomous_training": bool(getattr(self, "autonomous_trainer", None)),
                 "introspective_learning": bool(getattr(self, "introspective_learning", None)),
                 "environment_awareness": bool(getattr(self, "environment_observer", None)),
+                "response_rationale": bool(getattr(self, "response_rationale", None)),
+                "self_code_user_enabled": bool(getattr(self, "self_code", None)),
             },
             "excluded_modules": sorted(MODULE_DYNAMIC_LOAD_EXCLUDE_FILES),
             "loaded_modules": [
@@ -2843,6 +2856,63 @@ class PortableLLM:
             logger.warning("Introspective Learning module unavailable: %s", exc)
             return None
 
+    def _create_response_rationale(self):
+        """Attach the observable response-decision audit store."""
+        module = self._get_loaded_module_by_filename(RESPONSE_RATIONALE_MODULE_FILE)
+        cls = getattr(module, "ResponseRationale", None) if module else None
+        if not cls:
+            return None
+        try:
+            return cls(db_path=self._module_db_path(RESPONSE_RATIONALE_DB_PATH))
+        except Exception as exc:
+            logger.warning("Response rationale module unavailable: %s", exc)
+            return None
+
+    def enable_self_code(self, user_approved: bool = False) -> Dict[str, object]:
+        """Load the write-capable self-code module only after explicit session approval."""
+        if not user_approved:
+            return {"ok": False, "loaded": False, "error": "Explicit user approval is required."}
+        if self.self_code:
+            return {"ok": True, **self.self_code.status()}
+        path = self._modules_root() / SELF_CODE_MODULE_FILE
+        module = self._load_script_module_from_path(path) if path.exists() else None
+        cls = getattr(module, "SelfCodeModule", None) if module else None
+        if not cls:
+            return {"ok": False, "loaded": False, "error": "Self-code module could not be loaded."}
+        try:
+            self.self_code = cls(project_root=str(Path(__file__).resolve().parent))
+            self.dynamic_module_engines[SELF_CODE_MODULE_FILE] = self.self_code
+            return {"ok": True, **self.self_code.status()}
+        except Exception as exc:
+            logger.warning("Self-code module unavailable: %s", exc)
+            self.self_code = None
+            return {"ok": False, "loaded": False, "error": str(exc)}
+
+    def self_code_status(self) -> Dict[str, object]:
+        if not self.self_code:
+            return {"loaded": False, "write_requires_explicit_approval": True}
+        return self.self_code.status()
+
+    def stage_self_update(self, relative_path: str, source: str, rationale: str = "") -> Dict[str, object]:
+        if not self.self_code:
+            return {"ok": False, "error": "Self-code is not enabled for this session."}
+        try:
+            return {"ok": True, **self.self_code.stage_update(relative_path, source, rationale)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def apply_self_update(self, proposal_id: str, user_approved: bool = False) -> Dict[str, object]:
+        if not self.self_code:
+            return {"ok": False, "error": "Self-code is not enabled for this session."}
+        return self.self_code.apply_update(proposal_id, approved=bool(user_approved))
+
+    def get_last_response_rationale(self) -> Dict[str, object]:
+        """Return the latest observable response rationale for /why and UIs."""
+        if not self.response_rationale:
+            return {"ok": False, "error": "Response rationale module is unavailable."}
+        latest = self.response_rationale.latest()
+        return {"ok": bool(latest), "rationale": latest}
+
     @staticmethod
     def _quality_from_introspective_critique(critique, fallback_score: int = 70) -> ResponseQuality:
         """Convert an IntrospectiveLearning critique object into PortableLLM's quality object."""
@@ -3058,14 +3128,24 @@ class PortableLLM:
                 self._active_brain_action = None
                 self._active_brain_context = ""
 
+        context_channels: List[str] = []
         enriched = self._enrich_prompt_with_language_engine(prompt)
-        enriched = self._enrich_prompt_with_environment(enriched)
-        enriched = self._enrich_prompt_with_dynamic_modules(enriched, prompt)
-        enriched = self._enrich_prompt_with_cognitive_memory(enriched, prompt)
-        enriched = self._merge_enriched_prompts(enriched, self._enrich_prompt_with_knowledge(prompt))
-        enriched = self._enrich_prompt_with_online_search(enriched, prompt)
-        enriched = self._enrich_prompt_with_predictive_modules(enriched, prompt)
-        enriched = self._enrich_prompt_with_growth_learning(enriched, prompt)
+        if enriched.has_context:
+            context_channels.append("language_analysis")
+
+        def use_context(channel: str, candidate: EnrichedPrompt) -> None:
+            nonlocal enriched
+            if candidate.text != enriched.text:
+                context_channels.append(channel)
+            enriched = candidate
+
+        use_context("environment_snapshot", self._enrich_prompt_with_environment(enriched))
+        use_context("dynamic_modules", self._enrich_prompt_with_dynamic_modules(enriched, prompt))
+        use_context("cognitive_memory", self._enrich_prompt_with_cognitive_memory(enriched, prompt))
+        use_context("knowledge_db", self._merge_enriched_prompts(enriched, self._enrich_prompt_with_knowledge(prompt)))
+        use_context("online_search", self._enrich_prompt_with_online_search(enriched, prompt))
+        use_context("predictive_memory", self._enrich_prompt_with_predictive_modules(enriched, prompt))
+        use_context("growth_learning", self._enrich_prompt_with_growth_learning(enriched, prompt))
         enriched = self._build_tri_channel_final_prompt(prompt, enriched, parser_packet, brain_meta)
         self.conversation.add_message(
             "user",
@@ -3100,6 +3180,8 @@ class PortableLLM:
                 quality = retry_quality
                 refined = bool(refined or retry_refined)
                 online_search_retry = True
+                if "online_search" not in context_channels:
+                    context_channels.append("online_search")
 
         used_offline = False
         if not response and self.offline:
@@ -3174,6 +3256,26 @@ class PortableLLM:
 
         if response and str(response).strip():
             model_used = self.model if provider_used == self.provider else self._default_model_for(provider_used)
+            rationale_meta = None
+            if self.response_rationale:
+                try:
+                    rationale_meta = self.response_rationale.record(
+                        prompt=prompt,
+                        response=str(response),
+                        provider=provider_used,
+                        model=model_used,
+                        quality_score=quality.score,
+                        quality_reasons=quality.reasons,
+                        context_channels=context_channels,
+                        dynamic_modules=self._last_dynamic_context_modules,
+                        intent=profile.intent,
+                        strategy=(brain_meta or {}).get("strategy", ""),
+                        refined=refined,
+                        fallback_used=used_offline or provider_used == "grounded-fallback",
+                        introspection_changed=bool((introspection_meta or {}).get("changed_response")),
+                    )
+                except Exception as exc:
+                    logger.warning("Response rationale recording failed: %s", exc)
             self.improvement_store.record(
                 intent=profile.intent,
                 quality_score=quality.score,
@@ -3201,6 +3303,7 @@ class PortableLLM:
                     "brain_state": brain_meta,
                     "environment": environment_meta,
                     "introspection": introspection_meta,
+                    "response_rationale": rationale_meta,
                     "chat_learning_enabled": self.enable_chat_learning,
                 },
             )
@@ -3271,6 +3374,7 @@ class PortableLLM:
                 "brain_state": brain_meta,
                 "environment": environment_meta,
                 "introspection": introspection_meta,
+                "response_rationale": rationale_meta,
             }
             return response, metadata
 
@@ -3326,6 +3430,8 @@ class PortableLLM:
             "autonomous_training_enabled": bool(getattr(self, "autonomous_trainer", None)),
             "introspective_learning_enabled": bool(getattr(self, "introspective_learning", None)),
             "environment_awareness_enabled": bool(getattr(self, "environment_observer", None)),
+            "response_rationale_enabled": bool(getattr(self, "response_rationale", None)),
+            "self_code_user_enabled": bool(getattr(self, "self_code", None)),
             "tri_channel_logic_enabled": True,
             "growth_learning_enabled": bool(getattr(self, "growth_store", None)),
             "autonomous_training": self._autonomous_training_stats(),
@@ -3373,6 +3479,16 @@ class PortableLLM:
                 "module_load_report_available": True,
                 "loaded_modules_count": stats.get("loaded_modules_count", 0),
                 "dynamic_module_engines_count": stats.get("dynamic_module_engines_count", 0),
+                "response_rationale_db": self._module_db_path(RESPONSE_RATIONALE_DB_PATH),
+                "response_rationale_is_observable_evidence_not_chain_of_thought": True,
+            },
+            "self_code_controls": {
+                "excluded_from_startup_scan": SELF_CODE_MODULE_FILE in MODULE_DYNAMIC_LOAD_EXCLUDE_FILES,
+                "loaded_for_session": bool(getattr(self, "self_code", None)),
+                "load_requires_user_approval": True,
+                "each_apply_requires_separate_user_approval": True,
+                "workspace_path_confinement": True,
+                "diff_and_backup_before_activation": True,
             },
             "runtime_stats": stats,
             "module_controls": self.list_loaded_modules(),
@@ -5395,7 +5511,7 @@ def launch_portable_llm_chat(
 ) -> None:
     """Launch a desktop chat window for PortableLLM (no terminal loop)."""
     import tkinter as tk
-    from tkinter import filedialog
+    from tkinter import filedialog, messagebox
     from tkinter import ttk
     import webbrowser
 
@@ -5669,6 +5785,13 @@ def launch_portable_llm_chat(
 
         root.after(100, poll_ingest_results)
 
+    def show_why() -> None:
+        payload = llm.get_last_response_rationale()
+        if payload.get("ok"):
+            append_block("WHY", json.dumps(payload["rationale"], indent=2, ensure_ascii=False))
+        else:
+            append_block("WHY", payload.get("error") or "No response rationale is available yet.")
+
     def send_message(*_args) -> None:
         user_text = input_var.get().strip()
         if not user_text:
@@ -5732,6 +5855,9 @@ def launch_portable_llm_chat(
     clear_btn = ttk.Button(controls, text="Clear", command=lambda: transcript.delete("1.0", tk.END))
     clear_btn.pack(side=tk.LEFT, padx=(8, 0))
 
+    why_btn = ttk.Button(controls, text="Why?", command=show_why)
+    why_btn.pack(side=tk.LEFT, padx=(8, 0))
+
     ingest_controls = ttk.Frame(ingest_tab)
     ingest_controls.pack(fill=tk.X, pady=(8, 8))
 
@@ -5764,7 +5890,20 @@ def launch_portable_llm_chat(
             append_ingest(f"Auto folder ingest started: {folder_path} (recursive=True)")
             threading.Thread(target=worker_ingest_folder, args=(folder_path, True), daemon=True).start()
 
-    root.after(250, show_donation_popup)
+    def prompt_for_self_code() -> None:
+        approved = messagebox.askyesno(
+            "Optional Self-Code Module",
+            "Load Perseus's self-code module for this session?\n\n"
+            "It will remain unloaded unless you choose Yes. File changes are staged as diffs "
+            "and still require separate explicit approval before they are applied.",
+            parent=root,
+        )
+        result = llm.enable_self_code(user_approved=approved) if approved else llm.self_code_status()
+        state = "enabled" if result.get("loaded") else "not loaded"
+        append_block("SYSTEM", f"Self-code module: {state}.")
+        root.after(250, show_donation_popup)
+
+    root.after(250, prompt_for_self_code)
 
     def on_close() -> None:
         llm.close()
@@ -5798,7 +5937,7 @@ def launch_portable_llm_terminal_chat(
     startup_knowledge_folders = knowledge_folders or list(DEFAULT_AUTO_KNOWLEDGE_FOLDERS)
 
     print(f"Perseus terminal chat ready. Provider={llm.provider} Model={llm.model}")
-    print("Commands: /exit, /quit, /stats, /compliance, /providers, /ingest <folder>")
+    print("Commands: /exit, /quit, /stats, /why, /self-code, /compliance, /providers, /ingest <folder>")
 
     try:
         if auto_ingest_folders:
@@ -5811,6 +5950,18 @@ def launch_portable_llm_terminal_chat(
                     f"{result.get('failures', 0)} failed, "
                     f"{result.get('skipped', 0)} skipped"
                 )
+
+        try:
+            self_code_choice = input(
+                "Load the optional self-code module for this session? "
+                "Updates still require separate approval. [y/N] "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            self_code_choice = ""
+        if self_code_choice in {"y", "yes"}:
+            print(json.dumps(llm.enable_self_code(user_approved=True), indent=2))
+        else:
+            print("Self-code module remains unloaded.")
 
         while True:
             try:
@@ -5833,6 +5984,12 @@ def launch_portable_llm_terminal_chat(
                 continue
             if command == "/providers":
                 print(", ".join(llm.available_providers()) or "No providers available")
+                continue
+            if command == "/why":
+                print(json.dumps(llm.get_last_response_rationale(), indent=2, ensure_ascii=False))
+                continue
+            if command == "/self-code":
+                print(json.dumps(llm.self_code_status(), indent=2))
                 continue
             if command.startswith("/ingest "):
                 folder = user_text.split(" ", 1)[1].strip().strip('"')
